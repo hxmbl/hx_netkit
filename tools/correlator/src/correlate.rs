@@ -1205,6 +1205,30 @@ impl OllamaClient {
             .unwrap_or(false)
     }
 
+    /// Try to start Ollama in the background. Returns true if started successfully.
+    pub fn try_start() -> bool {
+        use std::process::Command;
+        // Check if already running
+        if reqwest::blocking::get("http://localhost:11434/api/tags").map(|r| r.status().is_success()).unwrap_or(false) {
+            return true;
+        }
+        // Try launching ollama serve in background
+        let _ = Command::new("ollama").arg("serve")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        // Wait up to 5 seconds for it to come up
+        for _ in 0..10 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if reqwest::blocking::get("http://localhost:11434/api/tags")
+                .map(|r| r.status().is_success())
+                .unwrap_or(false) {
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn generate(&self, prompt: &str) -> Result<String, String> {
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(120))

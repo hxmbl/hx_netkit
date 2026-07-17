@@ -216,7 +216,27 @@ fn run_capture(interface: &str, filter: Option<&str>, output: Option<&str>, real
                                 println!("\n\n═══ MANUAL ANALYSIS ({} packets, {} in window) ═══", engine.packet_count(), engine.window_size());
                                 let findings = engine.analyze();
                                 print_findings(&findings);
-                                if ollama.is_available() {
+                                if !ollama.is_available() {
+                                    print!("\n[System] Ollama not running. Start it? [y/N] ");
+                                    io::stdout().flush().ok();
+                                    crossterm::terminal::enable_raw_mode().ok();
+                                    // Read a single keypress
+                                    if let Event::Key(key) = event::read().unwrap() {
+                                        if key.code == KeyCode::Char('y') || key.code == KeyCode::Char('Y') {
+                                            crossterm::terminal::disable_raw_mode().ok();
+                                            print!("[System] Starting Ollama...");
+                                            io::stdout().flush().ok();
+                                            if OllamaClient::try_start() {
+                                                println!(" OK");
+                                                println!("\n── AI Analysis ──");
+                                                let report = ollama.analyze_findings(&findings, engine.profiles());
+                                                println!("{}", report);
+                                            } else {
+                                                println!(" FAILED (is 'ollama' installed?)");
+                                            }
+                                        }
+                                    }
+                                } else {
                                     println!("\n── AI Analysis ──");
                                     let report = ollama.analyze_findings(&findings, engine.profiles());
                                     println!("{}", report);
@@ -300,11 +320,31 @@ fn run_capture(interface: &str, filter: Option<&str>, output: Option<&str>, real
                             let findings = engine.analyze();
                             print_findings(&findings);
 
-                            if ollama.is_available() && !findings.is_empty() {
-                                println!("\n── AI Threat Assessment ──");
-                                match ollama.threat_summary(&findings) {
-                                    report => println!("{}", report),
+                            if !ollama.is_available() {
+                                print!("\n[System] Ollama not running. Start it? [y/N] ");
+                                io::stdout().flush().ok();
+                                crossterm::terminal::enable_raw_mode().ok();
+                                if let Event::Key(key) = event::read().unwrap() {
+                                    if key.code == KeyCode::Char('y') || key.code == KeyCode::Char('Y') {
+                                        crossterm::terminal::disable_raw_mode().ok();
+                                        print!("[System] Starting Ollama...");
+                                        io::stdout().flush().ok();
+                                        if OllamaClient::try_start() {
+                                            println!(" OK");
+                                            if !findings.is_empty() {
+                                                println!("\n── AI Threat Assessment ──");
+                                                let report = ollama.threat_summary(&findings);
+                                                println!("{}", report);
+                                            }
+                                        } else {
+                                            println!(" FAILED (is 'ollama' installed?)");
+                                        }
+                                    }
                                 }
+                            } else if !findings.is_empty() {
+                                println!("\n── AI Threat Assessment ──");
+                                let report = ollama.threat_summary(&findings);
+                                println!("{}", report);
                             }
                             crossterm::terminal::enable_raw_mode().ok();
                             last_auto_analyze = std::time::Instant::now();
