@@ -117,6 +117,24 @@ enum Commands {
         #[arg(long, default_value = "qwen2.5-coder:1.5b")]
         model: String,
     },
+
+    /// Scan network with nmap and store results
+    Scan {
+        /// Target IP, range, or CIDR (e.g. 192.168.1.0/24)
+        #[arg(short, long)]
+        target: String,
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Also capture traffic while scanning
+        #[arg(long)]
+        interface: Option<String>,
+    },
+
+    /// List known devices from scans
+    Devices {
+        #[arg(short, long)]
+        db: PathBuf,
+    },
 }
 
 // ── Database ─────────────────────────────────────────────────
@@ -134,7 +152,27 @@ fn init_db(db_path: &Path) -> Connection {
         CREATE INDEX IF NOT EXISTS idx_epoch ON packets(epoch);
         CREATE INDEX IF NOT EXISTS idx_src ON packets(ip_src);
         CREATE INDEX IF NOT EXISTS idx_dst ON packets(ip_dst);
-        CREATE INDEX IF NOT EXISTS idx_dns ON packets(dns_query);"
+        CREATE INDEX IF NOT EXISTS idx_dns ON packets(dns_query);
+
+        CREATE TABLE IF NOT EXISTS devices (
+            ip TEXT PRIMARY KEY,
+            mac TEXT,
+            hostname TEXT,
+            vendor TEXT,
+            os_guess TEXT,
+            ports TEXT,
+            first_seen REAL,
+            last_seen REAL,
+            notes TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS nmap_scans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            target TEXT,
+            scan_time REAL,
+            raw_xml TEXT,
+            summary TEXT
+        );"
     ).expect("Failed to create tables");
     conn
 }
@@ -145,6 +183,249 @@ fn open_db(db_path: &Path) -> Connection {
         std::process::exit(1);
     }
     Connection::open(db_path).expect("Failed to open database")
+}
+
+// ── Nmap Scan ────────────────────────────────────────────────
+
+fn run_scan(target: &str, output: Option<&Path>, interface: Option<&str>) {
+    // Check nmap is installed
+    if Command::new("nmap").arg("--version").stdout(Stdio::null()).status().is_err() {
+        eprintln!("[Error] nmap not found. Install it: brew install nmap");
+        std::process::exit(1);
+    }
+
+    let db_path = match output {
+        Some(p) => p.to_path_buf(),
+        None => std::env::temp_dir().join(format!("scan_{}.db", chrono_suffix())),
+    };
+
+    println!("[System] Target: {}", target);
+    println!("[System] Database: {}", db_path.display());
+
+    // Run nmap with OS detection, version detection, and script scanning
+    println!("[System] Running nmap scan (this may take a while)...");
+    let mut args = vec![
+        "-sV",           // version detection
+        "-O",            // OS detection
+        "-sC",           // default scripts
+        "--open",        // only show open ports
+        "-oX", "-",      // XML output to stdout
+        "-T4",           // aggressive timing
+        target,
+    ];
+
+    let mut cmd = Command::new("sudo");
+    cmd.arg("nmap").args(&args);
+
+    // If interface specified, add it
+    if let Some(iface) = interface {
+        args.insert(0, "-e");
+        args.insert(1, iface);
+        cmd.arg("-e").arg(iface);
+    }
+
+    let output = cmd.output().expect("Failed to run nmap");
+    let xml_str = String::from_utf8_lossy(&output.stdout);
+
+    if xml_str.is_empty() {
+        eprintln!("[Error] nmap produced no output");
+        eprintln!("[Error] stderr: {}", String::from_utf8_lossy(&output.stderr));
+        std::process::exit(1);
+    }
+
+    // Parse nmap XML output
+    let conn = init_db(&db_path);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+
+    // Store raw scan
+    let summary = parse_nmap_xml(&xml_str, &conn, now);
+    conn.execute(
+        "INSERT INTO nmap_scans (target, scan_time, raw_xml, summary) VALUES (?1, ?2, ?3, ?4)",
+        params![target, now, xml_str.to_string(), summary],
+    ).expect("Failed to store scan");
+
+    println!("\n[System] Scan complete. Results stored in {}", db_path.display());
+}
+
+fn parse_nmap_xml(xml: &str, conn: &Connection, scan_time: f64) -> String {
+    let mut summary_lines = Vec::new();
+    let mut current_ip: Option<String> = None;
+    let mut current_mac: Option<String> = None;
+    let mut current_hostname: Option<String> = None;
+    let mut current_os: Option<String> = None;
+    let mut current_vendor: Option<String> = None;
+    let mut ports: Vec<String> = Vec::new();
+
+    // Simple XML parsing (no dependency needed)
+    for line in xml.lines() {
+        let trimmed = line.trim();
+
+        // Host start
+        if trimmed.contains("<host ") && trimmed.contains("addr=") {
+            // Extract addr
+            if let Some(start) = trimmed.find("addr=\"") {
+                let rest = &trimmed[start + 6..];
+                if let Some(end) = rest.find('"') {
+                    let addr = &rest[..end];
+                    if let Some(start2) = trimmed.find("addrtype=\"") {
+                        let rest2 = &trimmed[start2 + 10..];
+                        if let Some(end2) = rest2.find('"') {
+                            let addr_type = &rest2[..end2];
+                            if addr_type == "ipv4" {
+                                // Flush previous host
+                                if let Some(ip) = &current_ip {
+                                    let ports_str = ports.join(", ");
+                                    upsert_device(conn, ip, current_mac.as_deref(), current_hostname.as_deref(),
+                                                  current_vendor.as_deref(), current_os.as_deref(), &ports_str, scan_time);
+                                    summary_lines.push(format!("{} ({}) — {} [{}]", ip,
+                                        current_hostname.as_deref().unwrap_or("unknown"),
+                                        current_os.as_deref().unwrap_or("OS unknown"),
+                                        if ports_str.is_empty() { "no open ports".into() } else { ports_str }));
+                                }
+                                current_ip = Some(addr.to_string());
+                                current_mac = None;
+                                current_hostname = None;
+                                current_os = None;
+                                current_vendor = None;
+                                ports.clear();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // MAC address
+        if trimmed.contains("<address ") && trimmed.contains("addrtype=\"mac\"") {
+            if let Some(start) = trimmed.find("addr=\"") {
+                let rest = &trimmed[start + 6..];
+                if let Some(end) = rest.find('"') {
+                    current_mac = Some(rest[..end].to_string());
+                }
+            }
+            if let Some(start) = trimmed.find("vendor=\"") {
+                let rest = &trimmed[start + 8..];
+                if let Some(end) = rest.find('"') {
+                    current_vendor = Some(rest[..end].to_string());
+                }
+            }
+        }
+
+        // Hostname
+        if trimmed.contains("<hostname name=") {
+            if let Some(start) = trimmed.find("name=\"") {
+                let rest = &trimmed[start + 6..];
+                if let Some(end) = rest.find('"') {
+                    current_hostname = Some(rest[..end].to_string());
+                }
+            }
+        }
+
+        // OS detection
+        if trimmed.contains("<osmatch ") {
+            if let Some(start) = trimmed.find("name=\"") {
+                let rest = &trimmed[start + 6..];
+                if let Some(end) = rest.find('"') {
+                    if current_os.is_none() {
+                        current_os = Some(rest[..end].to_string());
+                    }
+                }
+            }
+        }
+
+        // Port
+        if trimmed.contains("<port ") && trimmed.contains("protocol=\"tcp\"") {
+            let port_num = if let Some(start) = trimmed.find("portid=\"") {
+                let rest = &trimmed[start + 8..];
+                if let Some(end) = rest.find('"') { &rest[..end] } else { "?" }
+            } else { "?" };
+
+            let state = if let Some(start) = trimmed.find("state=\"") {
+                let rest = &trimmed[start + 7..];
+                if let Some(end) = rest.find('"') { &rest[..end] } else { "?" }
+            } else { "?" };
+
+            let service = "?";
+            ports.push(format!("{}/{} {}", port_num, state, service));
+        }
+
+        // Service name (follows port)
+        if trimmed.contains("<service ") && trimmed.contains("name=\"") {
+            if let Some(start) = trimmed.find("name=\"") {
+                let rest = &trimmed[start + 6..];
+                if let Some(end) = rest.find('"') {
+                    let svc = &rest[..end];
+                    if let Some(last) = ports.last_mut() {
+                        *last = last.replace("?", svc);
+                    }
+                }
+            }
+        }
+    }
+
+    // Flush last host
+    if let Some(ip) = &current_ip {
+        let ports_str = ports.join(", ");
+        upsert_device(conn, ip, current_mac.as_deref(), current_hostname.as_deref(),
+                      current_vendor.as_deref(), current_os.as_deref(), &ports_str, scan_time);
+        summary_lines.push(format!("{} ({}) — {} [{}]", ip,
+            current_hostname.as_deref().unwrap_or("unknown"),
+            current_os.as_deref().unwrap_or("OS unknown"),
+            if ports_str.is_empty() { "no open ports".into() } else { ports_str }));
+    }
+
+    summary_lines.join("\n")
+}
+
+fn upsert_device(conn: &Connection, ip: &str, mac: Option<&str>, hostname: Option<&str>,
+                  vendor: Option<&str>, os_guess: Option<&str>, ports: &str, now: f64) {
+    // Try to update existing, insert if new
+    let rows = conn.execute(
+        "UPDATE devices SET mac = COALESCE(?2, mac), hostname = COALESCE(?3, hostname),
+         vendor = COALESCE(?4, vendor), os_guess = COALESCE(?5, os_guess), ports = ?6, last_seen = ?7
+         WHERE ip = ?1",
+        params![ip, mac, hostname, vendor, os_guess, ports, now],
+    ).unwrap_or(0);
+
+    if rows == 0 {
+        conn.execute(
+            "INSERT INTO devices (ip, mac, hostname, vendor, os_guess, ports, first_seen, last_seen)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+            params![ip, mac, hostname, vendor, os_guess, ports, now],
+        ).expect("Failed to insert device");
+    }
+}
+
+fn run_devices(db_path: &Path) {
+    let conn = open_db(db_path);
+    let mut stmt = conn.prepare(
+        "SELECT ip, mac, hostname, vendor, os_guess, ports, first_seen, last_seen FROM devices ORDER BY last_seen DESC"
+    ).unwrap();
+
+    let devices: Vec<(String, Option<String>, Option<String>, Option<String>, Option<String>, String, f64, f64)> =
+        stmt.query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?))
+        }).unwrap().filter_map(|r| r.ok()).collect();
+
+    if devices.is_empty() {
+        println!("No devices found. Run 'correlator scan' first.");
+        return;
+    }
+
+    println!("── Known Devices ({} total) ──\n", devices.len());
+    println!("{:<16} {:<18} {:<25} {:<20} {}", "IP", "MAC", "Hostname", "OS", "Ports");
+    println!("{}", "─".repeat(120));
+
+    for (ip, mac, hostname, _vendor, os_guess, ports, _first, _last) in &devices {
+        let mac_str = mac.as_deref().unwrap_or("-");
+        let host_str = hostname.as_deref().unwrap_or("-");
+        let os_str = os_guess.as_deref().unwrap_or("-");
+        let ports_display = if ports.len() > 40 { format!("{}…", &ports[..37]) } else { ports.clone() };
+        println!("{:<16} {:<18} {:<25} {:<20} {}", ip, mac_str, host_str, os_str, ports_display);
+    }
 }
 
 // ── Capture ──────────────────────────────────────────────────
@@ -476,6 +757,15 @@ fn run_ask(db_path: &Path, question: &str, model: &str) {
     let conn = open_db(db_path);
     let _total: u64 = conn.query_row("SELECT COUNT(*) FROM packets", [], |r| r.get(0)).unwrap_or(0);
     let packets = load_from_db(&conn);
+
+    // Load device data from nmap scans if available
+    let devices: Vec<(String, Option<String>, Option<String>, Option<String>, Option<String>, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT ip, mac, hostname, vendor, os_guess, ports FROM devices"
+        ).unwrap_or_else(|_| conn.prepare("SELECT ip, NULL, NULL, NULL, NULL, '' FROM devices").unwrap());
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
+            .unwrap().filter_map(|r| r.ok()).collect()
+    };
     drop(conn);
 
     let mut correlator = Correlator::new();
@@ -488,10 +778,29 @@ fn run_ask(db_path: &Path, question: &str, model: &str) {
         std::process::exit(1);
     }
 
-    // Build context
-    let findings_summary: String = findings.iter().take(20).map(|f|
-        format!("{} [{}] {}%: {}", f.ip, f.kind, (f.confidence * 100.0) as u32, f.detail)
-    ).collect::<Vec<_>>().join("\n");
+    // Build device context
+    let device_summary = if devices.is_empty() {
+        String::from("(no nmap scan data available — run 'correlator scan' first)")
+    } else {
+        devices.iter().map(|(ip, mac, hostname, vendor, os, ports)| {
+            format!("IP: {} | MAC: {} | Host: {} | Vendor: {} | OS: {} | Ports: {}",
+                ip,
+                mac.as_deref().unwrap_or("?"),
+                hostname.as_deref().unwrap_or("?"),
+                vendor.as_deref().unwrap_or("?"),
+                os.as_deref().unwrap_or("?"),
+                if ports.is_empty() { "none".into() } else { ports.clone() })
+        }).collect::<Vec<_>>().join("\n")
+    };
+
+    // Build findings context
+    let findings_summary = if findings.is_empty() {
+        String::from("(no findings)")
+    } else {
+        findings.iter().take(30).map(|f|
+            format!("{} [{}] {}%: {}", f.ip, f.kind, (f.confidence * 100.0) as u32, f.detail)
+        ).collect::<Vec<_>>().join("\n")
+    };
 
     let stats_summary = format!(
         "{} total packets, {} unique IPs, {} DNS domains",
@@ -500,19 +809,29 @@ fn run_ask(db_path: &Path, question: &str, model: &str) {
         correlator.profiles().values().map(|p| p.dns_domains.len()).sum::<usize>(),
     );
 
+    let profiles_summary: String = correlator.profiles().iter().take(20).map(|(ip, p)| {
+        let dns = if p.dns_domains.is_empty() { String::new() } else { format!(", dns: {}", p.dns_domains.keys().take(5).cloned().collect::<Vec<_>>().join(",")) };
+        let ports = if p.dest_ports.is_empty() { String::new() } else { format!(", ports: {}", p.dest_ports.iter().take(5).map(|(port, cnt)| format!("{}/{}", port, cnt)).collect::<Vec<_>>().join(",")) };
+        format!("{}: {} pkts ({}↑ {}↓){}{}", ip, p.packet_count, p.outbound_count, p.inbound_count, dns, ports)
+    }).collect::<Vec<_>>().join("\n");
+
     let prompt = format!(
-        "You are a network security analyst. Based on this network capture data:\n\n\
-         ## Stats\n{}\n\n\
-         ## Findings\n{}\n\n\
-         ## Top IPs\n{}\n\n\
-         ## Question\n{}\n\n\
-         Answer the question based on the network data. Be specific and reference actual IPs and patterns.",
+        "You are a network security analyst analyzing a home/office network. You have access to BOTH traffic capture data AND nmap scan results.\n\n\
+         ## Known Devices (from nmap)\n{}\n\n\
+         ## Traffic Stats\n{}\n\n\
+         ## IP Profiles\n{}\n\n\
+         ## Detected Findings\n{}\n\n\
+         ## Task\n\
+         Answer the user's question about this network. Be specific:\n\
+         - Identify devices by their role (router, phone, laptop, IoT, server, etc.) based on hostname, vendor, OS, ports, and traffic patterns\n\
+         - Cross-reference nmap data with traffic data (e.g., device at 192.168.1.100 has port 80 open AND serves HTTP to other devices)\n\
+         - Note any suspicious activity, unusual connections, or potential security concerns\n\
+         - If you don't have enough data to answer definitively, say so and suggest what additional scans would help\n\n\
+         ## Question\n{}",
+        device_summary,
         stats_summary,
+        profiles_summary,
         findings_summary,
-        correlator.profiles().iter().take(10).map(|(ip, p)|
-            format!("{}: {} pkts, {} out, {} in, {} dns, {} domains",
-                ip, p.packet_count, p.outbound_count, p.inbound_count, p.dns_count, p.dns_domains.len())
-        ).collect::<Vec<_>>().join("\n"),
         question,
     );
 
@@ -726,6 +1045,8 @@ fn main() {
         Some(Commands::List { dir }) => { run_list(&dir.unwrap_or_else(|| std::env::temp_dir())); }
         Some(Commands::Threat { db, model }) => { run_threat(&db, &model); }
         Some(Commands::Ask { db, question, model }) => { run_ask(&db, &question, &model); }
+        Some(Commands::Scan { target, output, interface }) => { run_scan(&target, output.as_deref(), interface.as_deref()); }
+        Some(Commands::Devices { db }) => { run_devices(&db); }
         None => { let i = select_interface(); println!("Starting on {}...", i); run_capture(&i, None, None, false, "qwen2.5-coder:1.5b"); }
     }
 }
