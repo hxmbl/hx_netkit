@@ -124,6 +124,11 @@ pub enum FindingKind {
     Tor,
     GameClient,
     IoTCoordinator,
+    LateralMovement,
+    DataExfil,
+    C2Beacon,
+    NetworkRecon,
+    PrinterIoT,
     Unknown,
 }
 
@@ -143,6 +148,11 @@ impl fmt::Display for FindingKind {
             FindingKind::Tor => write!(f, "TOR"),
             FindingKind::GameClient => write!(f, "GAME"),
             FindingKind::IoTCoordinator => write!(f, "IOT_COORD"),
+            FindingKind::LateralMovement => write!(f, "LATERAL_MOVEMENT"),
+            FindingKind::DataExfil => write!(f, "DATA_EXFIL"),
+            FindingKind::C2Beacon => write!(f, "C2_BEACON"),
+            FindingKind::NetworkRecon => write!(f, "NET_RECON"),
+            FindingKind::PrinterIoT => write!(f, "PRINTER_IOT"),
             FindingKind::Unknown => write!(f, "UNKNOWN"),
         }
     }
@@ -1018,6 +1028,298 @@ fn detect_game(profile: &IpProfile) -> Option<Finding> {
     }
 }
 
+fn is_private_ip(ip: &str) -> bool {
+    let parts: Vec<&str> = ip.split('.').collect();
+    if parts.len() != 4 { return false; }
+    let octets: Vec<u8> = parts.iter().filter_map(|p| p.parse().ok()).collect();
+    if octets.len() != 4 { return false; }
+    match octets[0] {
+        10 => true,
+        172 => octets[1] >= 16 && octets[1] <= 31,
+        192 => octets[1] == 168,
+        _ => false,
+    }
+}
+
+fn detect_lateral_movement(profile: &IpProfile, all_profiles: &HashMap<String, IpProfile>) -> Option<Finding> {
+    let mut score: f64 = 0.0;
+    let mut indicators = Vec::new();
+
+    let internal_dests: Vec<_> = profile.dest_ips.keys().filter(|ip| is_private_ip(ip)).collect();
+    let internal_count = internal_dests.len();
+
+    if internal_count < 4 { return None; }
+
+    score += 0.25;
+    indicators.push(format!("connecting to {} internal hosts", internal_count));
+
+    let unique_ports: Vec<_> = profile.dest_ports.keys().filter(|p| **p < 1024 || **p == 8080 || **p == 3389).collect();
+    if unique_ports.len() >= 3 {
+        score += 0.25;
+        indicators.push(format!("using {} management ports: {}", unique_ports.len(),
+            unique_ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")));
+    }
+
+    let internal_pkts: u64 = profile.dest_ips.iter()
+        .filter(|(ip, _)| is_private_ip(ip))
+        .map(|(_, c)| c)
+        .sum();
+    let total_out = profile.outbound_count.max(1) as f64;
+    let internal_ratio = internal_pkts as f64 / total_out;
+    if internal_ratio > 0.6 {
+        score += 0.2;
+        indicators.push(format!("{:.0}% traffic to internal hosts", internal_ratio * 100.0));
+    }
+
+    let others_can_see: Vec<_> = internal_dests.iter()
+        .filter(|dest| all_profiles.contains_key(dest.as_str()))
+        .collect();
+    if others_can_see.len() >= 2 {
+        score += 0.15;
+        indicators.push(format!("{} target hosts have traffic profiles", others_can_see.len()));
+    }
+
+    let duration = profile.last_seen - profile.first_seen;
+    if duration > 0.0 && internal_count as f64 / duration > 0.5 {
+        score += 0.1;
+        indicators.push(format!("rapid internal scanning: {:.1} hosts/s", internal_count as f64 / duration));
+    }
+
+    if score >= 0.35 {
+        Some(Finding {
+            ip: profile.ip.clone(),
+            kind: FindingKind::LateralMovement,
+            confidence: score.min(1.0),
+            detail: indicators.join("; "),
+            indicators,
+        })
+    } else {
+        None
+    }
+}
+
+fn detect_data_exfil(profile: &IpProfile) -> Option<Finding> {
+    let mut score: f64 = 0.0;
+    let mut indicators = Vec::new();
+
+    let external_dests: Vec<_> = profile.dest_ips.iter()
+        .filter(|(ip, _)| !is_private_ip(ip))
+        .collect();
+
+    if external_dests.is_empty() { return None; }
+
+    if profile.inbound_count > 0 {
+        let ratio = profile.outbound_count as f64 / profile.inbound_count as f64;
+        if ratio > 8.0 && profile.outbound_count > 50 {
+            score += 0.35;
+            indicators.push(format!("high outbound ratio: {:.1}:1 ({} out, {} in)", ratio, profile.outbound_count, profile.inbound_count));
+        }
+    }
+
+    if let Some((ip, &count)) = external_dests.iter().max_by_key(|(_, c)| *c) {
+        let pct = count as f64 / profile.packet_count as f64;
+        if pct > 0.85 && count > 40 {
+            score += 0.3;
+            indicators.push(format!("{}% of outbound to single IP {} ({})", (pct * 100.0) as u32, ip, count));
+        }
+    }
+
+    if profile.dns_domains.len() <= 3 && profile.outbound_count > 60 {
+        score += 0.15;
+        indicators.push(format!("only {} DNS domains with {} outbound packets (pre-configured destination)", profile.dns_domains.len(), profile.outbound_count));
+    }
+
+    let duration = profile.last_seen - profile.first_seen;
+    if duration > 60.0 && profile.outbound_count > 100 {
+        score += 0.1;
+        indicators.push(format!("sustained over {:.0}s", duration));
+    }
+
+    if score >= 0.35 {
+        Some(Finding {
+            ip: profile.ip.clone(),
+            kind: FindingKind::DataExfil,
+            confidence: score.min(1.0),
+            detail: indicators.join("; "),
+            indicators,
+        })
+    } else {
+        None
+    }
+}
+
+fn detect_c2_beacon(profile: &IpProfile) -> Option<Finding> {
+    let mut score: f64 = 0.0;
+    let mut indicators = Vec::new();
+
+    let intervals: Vec<f64> = profile.inter_arrival_times.windows(2)
+        .map(|w| (w[1] - w[0]).abs())
+        .filter(|&x| x > 0.5)
+        .collect();
+
+    if intervals.len() < 8 { return None; }
+
+    let mean = intervals.iter().sum::<f64>() / intervals.len() as f64;
+    let variance = intervals.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / intervals.len() as f64;
+    let cv = variance.sqrt() / mean;
+
+    let is_regular = cv < 0.15 && mean > 5.0;
+    let is_jittered = cv >= 0.05 && cv < 0.3 && mean > 10.0;
+
+    if !is_regular && !is_jittered { return None; }
+
+    if is_regular {
+        score += 0.3;
+        indicators.push(format!("regular beacon: {:.1}s ± {:.3}s (CV: {:.4})", mean, variance.sqrt(), cv));
+    } else {
+        score += 0.2;
+        indicators.push(format!("jittered beacon: {:.1}s (CV: {:.3})", mean, cv));
+    }
+
+    let external_dests: Vec<_> = profile.dest_ips.iter().filter(|(ip, _)| !is_private_ip(ip)).collect();
+    if external_dests.len() == 1 {
+        score += 0.2;
+        indicators.push(format!("single external destination: {}", external_dests[0].0));
+    }
+
+    if profile.dns_count < 5 && profile.outbound_count > 20 {
+        score += 0.15;
+        indicators.push(format!("{} DNS queries, {} outbound (minimal DNS)", profile.dns_count, profile.outbound_count));
+    }
+
+    let avg_out = if profile.dest_ips.len() > 0 { profile.outbound_count as f64 / profile.dest_ips.len() as f64 } else { 0.0 };
+    if avg_out < 8.0 && avg_out > 0.0 {
+        score += 0.1;
+        indicators.push(format!("small payloads: {:.1} pkts/dest", avg_out));
+    }
+
+    if profile.packet_count < 500 && profile.dns_domains.len() <= 2 {
+        score += 0.1;
+        indicators.push("reconnaissance-style low volume".into());
+    }
+
+    if score >= 0.35 {
+        Some(Finding {
+            ip: profile.ip.clone(),
+            kind: FindingKind::C2Beacon,
+            confidence: score.min(1.0),
+            detail: indicators.join("; "),
+            indicators,
+        })
+    } else {
+        None
+    }
+}
+
+fn detect_network_recon(profile: &IpProfile) -> Option<Finding> {
+    let mut score: f64 = 0.0;
+    let mut indicators = Vec::new();
+
+    let mgmt_ports = [22, 23, 80, 443, 8080, 3389, 5900, 21, 2323, 9100];
+    let mgmt_port_hits: Vec<_> = profile.dest_ports.keys().filter(|p| mgmt_ports.contains(p)).collect();
+
+    if mgmt_port_hits.len() < 3 { return None; }
+
+    score += 0.3;
+    indicators.push(format!("probing management ports: {}", mgmt_port_hits.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")));
+
+    let internal_dests: Vec<_> = profile.dest_ips.keys().filter(|ip| is_private_ip(ip)).collect();
+    if internal_dests.len() >= 5 {
+        score += 0.25;
+        indicators.push(format!("targeting {} internal hosts", internal_dests.len()));
+    }
+
+    let avg_pkts_per_dest = if internal_dests.len() > 0 {
+        profile.outbound_count as f64 / internal_dests.len() as f64
+    } else { 0.0 };
+
+    if avg_pkts_per_dest < 5.0 && avg_pkts_per_dest > 0.0 {
+        score += 0.2;
+        indicators.push(format!("light touch: {:.1} pkts/host (probe pattern)", avg_pkts_per_dest));
+    }
+
+    if profile.inbound_count < profile.outbound_count / 4 && profile.outbound_count > 20 {
+        score += 0.15;
+        indicators.push("mostly unanswered probes".into());
+    }
+
+    if profile.dns_count == 0 && internal_dests.len() > 3 {
+        score += 0.1;
+        indicators.push("no DNS (targeting known IPs)".into());
+    }
+
+    if score >= 0.35 {
+        Some(Finding {
+            ip: profile.ip.clone(),
+            kind: FindingKind::NetworkRecon,
+            confidence: score.min(1.0),
+            detail: indicators.join("; "),
+            indicators,
+        })
+    } else {
+        None
+    }
+}
+
+fn detect_printers_iot(profile: &IpProfile, devices: &[(String, Option<String>, Option<String>, Option<String>, Option<String>, String)]) -> Option<Finding> {
+    let mut score: f64 = 0.0;
+    let mut indicators = Vec::new();
+
+    let iot_signal_ports = [5353, 1900, 5355, 5683, 5684, 9100, 631];
+    let iot_hits: Vec<_> = profile.src_ports.keys().chain(profile.dest_ports.keys())
+        .filter(|p| iot_signal_ports.contains(p))
+        .collect();
+    if !iot_hits.is_empty() {
+        score += 0.2;
+        indicators.push(format!("IoT ports: {}", iot_hits.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")));
+    }
+
+    let duration = profile.last_seen - profile.first_seen;
+    if duration > 0.0 {
+        let pps = profile.packet_count as f64 / duration;
+        if pps < 2.0 && profile.packet_count > 10 {
+            score += 0.2;
+            indicators.push(format!("very low rate: {:.2} pps", pps));
+        }
+    }
+
+    if let Some((_, _, hostname, vendor, os, _)) = devices.iter().find(|(ip, _, _, _, _, _)| ip == &profile.ip) {
+        let vendor_lower = vendor.as_deref().unwrap_or("").to_lowercase();
+        let os_lower = os.as_deref().unwrap_or("").to_lowercase();
+        let host_lower = hostname.as_deref().unwrap_or("").to_lowercase();
+
+        let printer_keywords = ["printer", "print", "brother", "canon", "epson", "hp", "xerox", "ricoh"];
+        let iot_keywords = ["smart tv", "roku", "chromecast", "alexa", "echo", "home", "hub", "nest", "ring"];
+
+        if printer_keywords.iter().any(|kw| vendor_lower.contains(kw) || host_lower.contains(kw) || os_lower.contains(kw)) {
+            score += 0.3;
+            indicators.push(format!("printer detected: vendor={}", vendor.as_deref().unwrap_or("?")));
+        }
+
+        if iot_keywords.iter().any(|kw| vendor_lower.contains(kw) || host_lower.contains(kw) || os_lower.contains(kw)) {
+            score += 0.25;
+            indicators.push(format!("IoT device: host={}", hostname.as_deref().unwrap_or("?")));
+        }
+    }
+
+    if profile.dns_count < 3 && profile.packet_count > 15 && profile.udp_count > profile.tcp_count {
+        score += 0.15;
+        indicators.push("low DNS, UDP-dominant (typical of printers/IoT)".into());
+    }
+
+    if score >= 0.35 {
+        Some(Finding {
+            ip: profile.ip.clone(),
+            kind: FindingKind::PrinterIoT,
+            confidence: score.min(1.0),
+            detail: indicators.join("; "),
+            indicators,
+        })
+    } else {
+        None
+    }
+}
+
 // ══════════════════════════════════════════════════════════════
 // Correlation Engine
 // ══════════════════════════════════════════════════════════════
@@ -1058,8 +1360,13 @@ impl Correlator {
     }
 
     pub fn correlate(&mut self) -> Vec<Finding> {
+        self.correlate_with_devices(&[])
+    }
+
+    pub fn correlate_with_devices(&mut self, devices: &[(String, Option<String>, Option<String>, Option<String>, Option<String>, String)]) -> Vec<Finding> {
         self.finalize();
         let mut findings = Vec::new();
+        let all_profiles = self.profiles.clone();
 
         for (_ip, profile) in &self.profiles {
             if profile.packet_count < 8 { continue; }
@@ -1086,6 +1393,22 @@ impl Correlator {
                 }
             }
 
+            if let Some(f) = detect_lateral_movement(profile, &all_profiles) {
+                ip_findings.push(f);
+            }
+            if let Some(f) = detect_data_exfil(profile) {
+                ip_findings.push(f);
+            }
+            if let Some(f) = detect_c2_beacon(profile) {
+                ip_findings.push(f);
+            }
+            if let Some(f) = detect_network_recon(profile) {
+                ip_findings.push(f);
+            }
+            if let Some(f) = detect_printers_iot(profile, devices) {
+                ip_findings.push(f);
+            }
+
             if ip_findings.is_empty() {
                 ip_findings.push(Finding {
                     ip: profile.ip.clone(),
@@ -1107,6 +1430,79 @@ impl Correlator {
 
     pub fn profiles(&self) -> &HashMap<String, IpProfile> { &self.profiles }
     pub fn packet_count(&self) -> usize { self.packets.len() }
+
+    pub fn cross_reference(&self, devices: &[(String, Option<String>, Option<String>, Option<String>, Option<String>, String)]) -> String {
+        let mut lines = Vec::new();
+
+        for (ip, _mac, hostname, vendor, os_guess, ports) in devices {
+            let hostname_str = hostname.as_deref().unwrap_or("unknown");
+            let os_str = os_guess.as_deref().unwrap_or("OS unknown");
+            let vendor_str = vendor.as_deref().unwrap_or("unknown vendor");
+
+            if let Some(profile) = self.profiles.get(ip) {
+                let duration = profile.last_seen - profile.first_seen;
+                let pps = if duration > 0.0 { profile.packet_count as f64 / duration } else { 0.0 };
+
+                let mut domain_vec: Vec<_> = profile.dns_domains.iter().collect();
+                domain_vec.sort_by(|a, b| b.1.cmp(a.1));
+                let top_domains: Vec<_> = domain_vec.iter()
+                    .take(5)
+                    .map(|(d, c)| format!("{}({})", d, c))
+                    .collect();
+
+                let mut port_vec: Vec<_> = profile.dest_ports.iter().collect();
+                port_vec.sort_by(|a, b| b.1.cmp(a.1));
+                let top_ports: Vec<_> = port_vec.iter()
+                    .take(5)
+                    .map(|(p, c)| format!("{}/{}", p, c))
+                    .collect();
+
+                let mut src_vec: Vec<_> = profile.src_ips.iter().collect();
+                src_vec.sort_by(|a, b| b.1.cmp(a.1));
+                let top_srcs: Vec<_> = src_vec.iter()
+                    .take(3)
+                    .map(|(ip, c)| format!("{}({})", ip, c))
+                    .collect();
+
+                lines.push(format!(
+                    "Device at {} ({}, {}, {}) — {} packets over {:.1}s ({:.1} pps), {} out / {} in, {} TCP, {} UDP\n\
+                     ️  DNS: {} domains [{}]\n\
+                     ️  Dest ports: [{}]\n\
+                     ️  Top sources: [{}]",
+                    ip, hostname_str, os_str, vendor_str,
+                    profile.packet_count, duration, pps, profile.outbound_count, profile.inbound_count,
+                    profile.tcp_count, profile.udp_count,
+                    profile.dns_domains.len(),
+                    top_domains.join(", "),
+                    top_ports.join(", "),
+                    top_srcs.join(", "),
+                ));
+
+                let open_tcp: Vec<_> = profile.src_ports.keys()
+                    .filter(|p| **p < 1024)
+                    .map(|p| p.to_string())
+                    .collect();
+                if !open_tcp.is_empty() {
+                    lines.push(format!("  Listening on: {}", open_tcp.join(", ")));
+                }
+
+                let server_clients = profile.src_ips.len();
+                if server_clients > 3 {
+                    lines.push(format!("  Serving {} unique clients", server_clients));
+                }
+            } else {
+                lines.push(format!(
+                    "Device at {} ({}, {}, {}) — no traffic observed in capture",
+                    ip, hostname_str, os_str, vendor_str,
+                ));
+                if !ports.is_empty() {
+                    lines.push(format!("  Open ports: {}", ports));
+                }
+            }
+        }
+
+        lines.join("\n")
+    }
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -1341,6 +1737,107 @@ impl OllamaClient {
 
         self.generate(&prompt).unwrap_or_else(|e| format!("[AI unavailable: {}]", e))
     }
+
+    pub fn generate_report(
+        &self,
+        findings: &[Finding],
+        profiles: &HashMap<String, IpProfile>,
+        devices: &[(String, Option<String>, Option<String>, Option<String>, Option<String>, String)],
+        nmap_summaries: &[String],
+        cross_ref: &str,
+    ) -> String {
+        let total_packets: u64 = profiles.values().map(|p| p.packet_count).sum();
+        let unique_ips = profiles.len();
+        let total_dns: usize = profiles.values().map(|p| p.dns_domains.len()).sum();
+        let unique_connections: usize = profiles.values().map(|p| p.sessions.len()).sum();
+
+        let duration = if let Some((min, max)) = profiles.values()
+            .map(|p| (p.first_seen, p.last_seen))
+            .reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)))
+        { max - min } else { 0.0 };
+
+        let mut top_talkers: Vec<_> = profiles.values().collect();
+        top_talkers.sort_by(|a, b| b.packet_count.cmp(&a.packet_count));
+        let top_talkers_str: Vec<_> = top_talkers.iter().take(15).map(|p| {
+            let dns = if p.dns_domains.is_empty() { String::new() } else {
+                let mut d: Vec<_> = p.dns_domains.iter().collect();
+                d.sort_by(|a, b| b.1.cmp(a.1));
+                format!(", dns: {}", d.iter().take(3).map(|(d, c)| format!("{}({})", d, c)).collect::<Vec<_>>().join(", "))
+            };
+            let ports = if p.dest_ports.is_empty() { String::new() } else {
+                let mut pp: Vec<_> = p.dest_ports.iter().collect();
+                pp.sort_by(|a, b| b.1.cmp(a.1));
+                format!(", ports: {}", pp.iter().take(3).map(|(p, c)| format!("{}/{}", p, c)).collect::<Vec<_>>().join(", "))
+            };
+            format!("  {}: {} pkts ({}↑ {}↓){}{}", p.ip, p.packet_count, p.outbound_count, p.inbound_count, dns, ports)
+        }).collect();
+
+        let mut all_domains: Vec<(&String, &u64)> = profiles.values()
+            .flat_map(|p| p.dns_domains.iter())
+            .collect();
+        all_domains.sort_by(|a, b| b.1.cmp(a.1));
+        let top_domains_str: Vec<_> = all_domains.iter().take(20).map(|(d, c)| format!("  {} — {}x", d, c)).collect();
+
+        let mut all_conns: Vec<_> = profiles.values()
+            .flat_map(|p| p.sessions.values())
+            .collect();
+        all_conns.sort_by(|a, b| b.pkt_count.cmp(&a.pkt_count));
+        let top_conns_str: Vec<_> = all_conns.iter().take(15).map(|s| {
+            format!("  {}:{} → {}:{} ({} pkts)", s.src, s.src_port, s.dst, s.dst_port, s.pkt_count)
+        }).collect();
+
+        let findings_str: Vec<_> = findings.iter().take(30).map(|f| {
+            format!("  {} [{}] {}%: {}", f.ip, f.kind, (f.confidence * 100.0) as u32, f.detail)
+        }).collect();
+
+        let nmap_str = if nmap_summaries.is_empty() {
+            "(no nmap scan data)".to_string()
+        } else {
+            nmap_summaries.join("\n")
+        };
+
+        let prompt = format!(
+            "You are a senior network security analyst with full visibility into this network. You have been given COMPLETE data from both nmap scanning and live traffic capture.\n\n\
+             ## Your Data\n\
+             - {} devices discovered via nmap scanning\n\
+             - {} packets captured over {:.1} seconds\n\
+             - {} unique IPs communicating\n\
+             - {} DNS domains resolved\n\
+             - {} distinct TCP/UDP connections observed\n\n\
+             ## Known Devices (from nmap)\n{}\n\n\
+             ## Traffic Patterns\n\
+             ### Top Talkers\n{}\n\n\
+             ### Top DNS Domains\n{}\n\n\
+             ### Most Active Connections\n{}\n\n\
+             ## Detected Anomalies\n{}\n\n\
+             ## Cross-Reference Analysis\n{}\n\n\
+             ## Your Mission\n\
+             Analyze this network comprehensively. You are looking for:\n\n\
+             1. **Device Inventory**: What is every device? Role? Trust level?\n\
+             2. **Communication Patterns**: Who talks to whom? What's normal vs abnormal?\n\
+             3. **DNS Intelligence**: What domains are being resolved? Any suspicious? DGA patterns?\n\
+             4. **Temporal Patterns**: When is traffic happening? Any off-hours activity? Periodic beacons?\n\
+             5. **Service Analysis**: What services are running? Any unexpected?\n\
+             6. **Anomaly Assessment**: Rate each anomaly. False positive or real threat?\n\
+             7. **Network Topology**: Map the network. What's the structure?\n\
+             8. **Security Recommendations**: What should the admin do?\n\n\
+             Be thorough. Cross-reference everything. Don't just list findings — INTERPRET them.\n\
+             What story does this network data tell? What is happening on this network right now?",
+            devices.len(),
+            total_packets, duration,
+            unique_ips,
+            total_dns,
+            unique_connections,
+            nmap_str,
+            top_talkers_str.join("\n"),
+            top_domains_str.join("\n"),
+            top_conns_str.join("\n"),
+            findings_str.join("\n"),
+            cross_ref,
+        );
+
+        self.generate(&prompt).unwrap_or_else(|e| format!("[AI unavailable: {}]", e))
+    }
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -1383,8 +1880,10 @@ pub fn print_findings(findings: &[Finding]) {
 
     let order = [
         FindingKind::Server, FindingKind::Browser, FindingKind::Bot,
-        FindingKind::Scanner, FindingKind::Beacon, FindingKind::Tor,
-        FindingKind::VPN, FindingKind::IoTDevice, FindingKind::IoTCoordinator,
+        FindingKind::Scanner, FindingKind::Beacon, FindingKind::C2Beacon,
+        FindingKind::LateralMovement, FindingKind::DataExfil, FindingKind::NetworkRecon,
+        FindingKind::Tor, FindingKind::VPN,
+        FindingKind::IoTDevice, FindingKind::PrinterIoT, FindingKind::IoTCoordinator,
         FindingKind::DNSProfiler, FindingKind::StreamingMedia,
         FindingKind::CloudSync, FindingKind::GameClient, FindingKind::Unknown,
     ];

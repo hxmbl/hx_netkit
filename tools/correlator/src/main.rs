@@ -1,6 +1,7 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use rusqlite::{Connection, params};
@@ -134,6 +135,36 @@ enum Commands {
     Devices {
         #[arg(short, long)]
         db: PathBuf,
+    },
+
+    /// Combined nmap + tshark monitor with AI analysis
+    Monitor {
+        /// Target CIDR to scan (e.g. 192.168.1.0/24)
+        #[arg(long)]
+        target: String,
+        /// Network interface for tshark (e.g. en1)
+        #[arg(long)]
+        interface: String,
+        /// Output database path
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Capture duration in seconds (default: 300)
+        #[arg(long, default_value_t = 300)]
+        duration: u64,
+        /// AI model to use
+        #[arg(long, default_value = "qwen2.5-coder:1.5b")]
+        model: String,
+        /// Skip AI analysis at end
+        #[arg(long)]
+        no_ai: bool,
+    },
+
+    /// Generate rich AI report from a capture database
+    Report {
+        #[arg(short, long)]
+        db: PathBuf,
+        #[arg(long, default_value = "qwen2.5-coder:1.5b")]
+        model: String,
     },
 }
 
@@ -426,6 +457,302 @@ fn run_devices(db_path: &Path) {
         let ports_display = if ports.len() > 40 { format!("{}…", &ports[..37]) } else { ports.clone() };
         println!("{:<16} {:<18} {:<25} {:<20} {}", ip, mac_str, host_str, os_str, ports_display);
     }
+}
+
+// ── Monitor (nmap + tshark combined) ─────────────────────────
+
+fn run_monitor(target: &str, interface: &str, output: Option<&Path>, duration: u64, model: &str, no_ai: bool) {
+    // Check tools are installed
+    if Command::new("nmap").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_err() {
+        eprintln!("[Error] nmap not found. Install it: brew install nmap");
+        std::process::exit(1);
+    }
+    if Command::new("tshark").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_err() {
+        eprintln!("[Error] tshark not found. Install it: brew install wireshark");
+        std::process::exit(1);
+    }
+
+    let db_path = match output {
+        Some(p) => p.to_path_buf(),
+        None => std::env::temp_dir().join(format!("monitor_{}.db", chrono_suffix())),
+    };
+
+    println!("═══════ CORRELATOR MONITOR ═══════");
+    println!("[System] Target: {}", target);
+    println!("[System] Interface: {}", interface);
+    println!("[System] Duration: {}s", duration);
+    println!("[System] Database: {}", db_path.display());
+    println!();
+
+    // ── Phase 1: nmap scan ──
+    println!("[System] Phase 1/2: Scanning network with nmap...");
+
+    let args = vec![
+        "-sV", "-O", "-sC", "--open", "-oX", "-", "-T4",
+        target,
+    ];
+
+    let mut cmd = Command::new("sudo");
+    cmd.arg("nmap").args(&args);
+
+    let nmap_output = cmd.output().expect("Failed to run nmap");
+    let xml_str = String::from_utf8_lossy(&nmap_output.stdout);
+
+    if xml_str.is_empty() {
+        eprintln!("[Error] nmap produced no output");
+        eprintln!("[Error] stderr: {}", String::from_utf8_lossy(&nmap_output.stderr));
+        std::process::exit(1);
+    }
+
+    let conn = init_db(&db_path);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+
+    let summary = parse_nmap_xml(&xml_str, &conn, now);
+    conn.execute(
+        "INSERT INTO nmap_scans (target, scan_time, raw_xml, summary) VALUES (?1, ?2, ?3, ?4)",
+        params![target, now, xml_str.to_string(), summary.clone()],
+    ).expect("Failed to store scan");
+
+    // Count devices
+    let device_count: u64 = conn.query_row("SELECT COUNT(*) FROM devices", [], |r| r.get(0)).unwrap_or(0);
+    println!("[System] Found {} devices.", device_count);
+    println!("{}", summary);
+    println!();
+
+    // ── Phase 2: tshark capture ──
+    println!("[System] Phase 2/2: Capturing traffic for {}s on {}...", duration, interface);
+    println!("[System] Press 'q' to stop early\n");
+
+    let tshark_args = vec![
+        "-i", interface, "-n", "-l", "-T", "ek",
+        "-f", "not host 127.0.0.1",
+        "-e", "frame.time_epoch", "-e", "ip.src", "-e", "ip.dst",
+        "-e", "tcp.srcport", "-e", "tcp.dstport",
+        "-e", "udp.srcport", "-e", "udp.dstport", "-e", "dns.qry.name",
+    ];
+
+    let mut child = Command::new("sudo").args(["tshark"]).args(&tshark_args)
+        .stdout(Stdio::piped()).stderr(Stdio::null())
+        .spawn().expect("Failed to start tshark — is it installed?");
+
+    // Timer thread to kill tshark after duration
+    let child_pid = child.id();
+    let timer_handle = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(duration));
+        let _ = Command::new("sudo").args(["kill", "-INT"]).arg(child_pid.to_string()).output();
+    });
+
+    if let Some(stdout_stream) = child.stdout.take() {
+        let reader = std::io::BufReader::new(stdout_stream);
+        let mut insert_stmt = conn
+            .prepare("INSERT INTO packets (epoch, ip_src, ip_dst, tcp_src_port, tcp_dst_port, udp_src_port, udp_dst_port, dns_query, raw_json) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)")
+            .unwrap();
+
+        let mut packet_count: u64 = 0;
+        let mut stored_count: u64 = 0;
+        let mut ips_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut dns_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let capture_start = std::time::Instant::now();
+
+        use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+        use std::io::BufRead;
+
+        crossterm::terminal::enable_raw_mode().expect("Failed to enable raw mode");
+
+        let mut _early_exit = false;
+
+        for line_result in reader.lines() {
+            if event::poll(Duration::from_millis(0)).unwrap() {
+                if let Event::Key(key_event) = event::read().unwrap() {
+                    if key_event.kind == KeyEventKind::Press {
+                        match key_event.code {
+                            KeyCode::Char('q') | KeyCode::Char('Q') => {
+                                println!("\r\x1b[K[System] Stopping early...");
+                                _early_exit = true;
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            match line_result {
+                Ok(raw_line) => {
+                    if raw_line.trim().is_empty() { continue; }
+                    if raw_line.contains("\"index\"") && !raw_line.contains("\"_source\"") { continue; }
+                    packet_count += 1;
+
+                    if let Ok(val) = serde_json::from_str::<Value>(&raw_line) {
+                        let layers = val.get("_source")
+                            .and_then(|s| s.get("layers"))
+                            .or_else(|| val.get("layers"))
+                            .and_then(|l| l.as_object());
+                        let flat = if layers.is_none() { val.as_object() } else { None };
+                        let get_field = |name: &str| -> Option<&str> {
+                            if let Some(l) = &layers {
+                                l.get(name).and_then(|v| v.as_str())
+                            } else if let Some(f) = &flat {
+                                f.get(name).and_then(|v| v.as_str())
+                            } else {
+                                None
+                            }
+                        };
+                        let epoch = get_field("frame.time_epoch").and_then(|s| s.parse::<f64>().ok());
+                        let ip_src = get_field("ip.src");
+                        let ip_dst = get_field("ip.dst");
+                        let tcp_src = get_field("tcp.srcport").and_then(|s| s.parse::<u32>().ok());
+                        let tcp_dst = get_field("tcp.dstport").and_then(|s| s.parse::<u32>().ok());
+                        let udp_src = get_field("udp.srcport").and_then(|s| s.parse::<u32>().ok());
+                        let udp_dst = get_field("udp.dstport").and_then(|s| s.parse::<u32>().ok());
+                        let dns_qry = get_field("dns.qry.name");
+
+                        if let Some(s) = ip_src { ips_seen.insert(s.to_string()); }
+                        if let Some(d) = ip_dst { ips_seen.insert(d.to_string()); }
+                        if let Some(d) = dns_qry { dns_seen.insert(d.to_string()); }
+
+                        let _ = insert_stmt.execute(params![
+                            epoch, ip_src, ip_dst, tcp_src, tcp_dst,
+                            udp_src, udp_dst, dns_qry, raw_line.trim()
+                        ]);
+                        stored_count += 1;
+                    }
+
+                    if packet_count % 100 == 0 {
+                        let elapsed = capture_start.elapsed().as_secs();
+                        print!("\r\x1b[K  {} captured, {} stored, {} IPs, {} DNS, {}s elapsed",
+                            packet_count, stored_count, ips_seen.len(), dns_seen.len(), elapsed);
+                        io::stdout().flush().ok();
+                    }
+                }
+                Err(_) => { break; }
+            }
+        }
+
+        crossterm::terminal::disable_raw_mode().ok();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = timer_handle.join();
+
+        println!("\n\n═══ CAPTURE COMPLETE ═══");
+        println!("[System] {} packets captured, {} stored", packet_count, stored_count);
+        println!("[System] {} unique IPs, {} DNS domains", ips_seen.len(), dns_seen.len());
+
+        // Run correlation engine
+        println!("\n═══ CORRELATION ENGINE ═══");
+        let packets = load_from_db(&conn);
+        let device_list: Vec<(String, Option<String>, Option<String>, Option<String>, Option<String>, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT ip, mac, hostname, vendor, os_guess, ports FROM devices"
+            ).unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
+                .unwrap().filter_map(|r| r.ok()).collect()
+        };
+
+        let mut correlator = Correlator::new();
+        correlator.ingest_batch(packets);
+        let findings = correlator.correlate_with_devices(&device_list);
+
+        println!("[System] {} IPs profiled.\n", correlator.profiles().len());
+        print_findings(&findings);
+
+        // Cross-reference
+        let cross_ref = correlator.cross_reference(&device_list);
+        if !cross_ref.is_empty() {
+            println!("\n═══ CROSS-REFERENCE ═══");
+            println!("{}", cross_ref);
+        }
+
+        // AI analysis
+        if !no_ai {
+            let ollama = OllamaClient::new(model);
+            if ollama.is_available() {
+                let nmap_summaries: Vec<String> = {
+                    let mut stmt = conn.prepare("SELECT summary FROM nmap_scans ORDER BY scan_time DESC").unwrap();
+                    stmt.query_map([], |r| r.get(0)).unwrap().filter_map(|r| r.ok()).collect()
+                };
+
+                println!("\n═══ AI ANALYSIS ═══");
+                let report = ollama.generate_report(&findings, correlator.profiles(), &device_list, &nmap_summaries, &cross_ref);
+                println!("{}", report);
+            } else {
+                println!("\n[System] Ollama not available. Attempting to start...");
+                if OllamaClient::try_start() {
+                    println!("[System] Ollama started.");
+                    let ollama = OllamaClient::new(model);
+                    let nmap_summaries: Vec<String> = {
+                        let mut stmt = conn.prepare("SELECT summary FROM nmap_scans ORDER BY scan_time DESC").unwrap();
+                        stmt.query_map([], |r| r.get(0)).unwrap().filter_map(|r| r.ok()).collect()
+                    };
+
+                    println!("\n═══ AI ANALYSIS ═══");
+                    let report = ollama.generate_report(&findings, correlator.profiles(), &device_list, &nmap_summaries, &cross_ref);
+                    println!("{}", report);
+                } else {
+                    println!("[System] Could not start Ollama. AI analysis skipped.");
+                }
+            }
+        }
+
+        println!("\n[System] Done — database at {}", db_path.display());
+    }
+}
+
+// ── Report (rich AI analysis) ───────────────────────────────
+
+fn run_report(db_path: &Path, model: &str) {
+    let conn = open_db(db_path);
+    let total: u64 = conn.query_row("SELECT COUNT(*) FROM packets", [], |r| r.get(0)).unwrap_or(0);
+    println!("[System] Loading {} packets...", total);
+    let packets = load_from_db(&conn);
+
+    let devices: Vec<(String, Option<String>, Option<String>, Option<String>, Option<String>, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT ip, mac, hostname, vendor, os_guess, ports FROM devices"
+        ).unwrap_or_else(|_| conn.prepare("SELECT ip, NULL, NULL, NULL, NULL, '' FROM devices").unwrap());
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
+            .unwrap().filter_map(|r| r.ok()).collect()
+    };
+
+    let nmap_summaries: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT summary FROM nmap_scans ORDER BY scan_time DESC").unwrap_or_else(|_| {
+            conn.prepare("SELECT '' FROM sqlite_master WHERE 0").unwrap()
+        });
+        stmt.query_map([], |r| r.get(0)).unwrap().filter_map(|r| r.ok()).collect()
+    };
+
+    drop(conn);
+
+    let mut correlator = Correlator::new();
+    correlator.ingest_batch(packets);
+    let findings = correlator.correlate_with_devices(&devices);
+
+    println!("[System] {} IPs profiled, {} findings.", correlator.profiles().len(), findings.len());
+
+    let cross_ref = correlator.cross_reference(&devices);
+
+    let ollama = OllamaClient::new(model);
+    if !ollama.is_available() {
+        println!("[System] Ollama not available. Attempting to start...");
+        if !OllamaClient::try_start() {
+            println!("[Error] Could not start Ollama. Install it: curl -fsSL https://ollama.com/install.sh | sh");
+            println!("\n═══ OFFLINE FINDINGS ═══");
+            print_findings(&findings);
+            if !cross_ref.is_empty() {
+                println!("\n═══ CROSS-REFERENCE ═══");
+                println!("{}", cross_ref);
+            }
+            return;
+        }
+        println!("[System] Ollama started.");
+    }
+
+    println!("\n═══ GENERATING REPORT ═══");
+    let report = ollama.generate_report(&findings, correlator.profiles(), &devices, &nmap_summaries, &cross_ref);
+    println!("{}", report);
 }
 
 // ── Capture ──────────────────────────────────────────────────
@@ -1047,6 +1374,10 @@ fn main() {
         Some(Commands::Ask { db, question, model }) => { run_ask(&db, &question, &model); }
         Some(Commands::Scan { target, output, interface }) => { run_scan(&target, output.as_deref(), interface.as_deref()); }
         Some(Commands::Devices { db }) => { run_devices(&db); }
+        Some(Commands::Monitor { target, interface, output, duration, model, no_ai }) => {
+            run_monitor(&target, &interface, output.as_deref(), duration, &model, no_ai);
+        }
+        Some(Commands::Report { db, model }) => { run_report(&db, &model); }
         None => { let i = select_interface(); println!("Starting on {}...", i); run_capture(&i, None, None, false, "qwen2.5-coder:1.5b"); }
     }
 }
