@@ -1,0 +1,5 @@
+[workspace]
+members = [
+    "tools/correlator"
+]
+resolver = "2"
