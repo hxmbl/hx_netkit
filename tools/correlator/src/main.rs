@@ -235,63 +235,79 @@ fn run_capture(interface: &str, filter: Option<&str>, output: Option<&str>, real
 
             match line_result {
                 Ok(raw_line) => {
-                    if raw_line.contains("\"index\"") || raw_line.trim().is_empty() { continue; }
+                    if raw_line.trim().is_empty() { continue; }
                     packet_count += 1;
 
                     if ingestion_enabled {
                         if let Ok(val) = serde_json::from_str::<Value>(&raw_line) {
-                            let layers = val.get("_source").and_then(|s| s.get("layers")).and_then(|l| l.as_object());
-                            if let Some(layers) = layers {
-                                let epoch = layers.get("frame.time_epoch").and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok());
-                                let ip_src = layers.get("ip.src").and_then(|v| v.as_str());
-                                let ip_dst = layers.get("ip.dst").and_then(|v| v.as_str());
-                                let tcp_src = layers.get("tcp.srcport").and_then(|v| v.as_str()).and_then(|s| s.parse::<u32>().ok());
-                                let tcp_dst = layers.get("tcp.dstport").and_then(|v| v.as_str()).and_then(|s| s.parse::<u32>().ok());
-                                let udp_src = layers.get("udp.srcport").and_then(|v| v.as_str()).and_then(|s| s.parse::<u32>().ok());
-                                let udp_dst = layers.get("udp.dstport").and_then(|v| v.as_str()).and_then(|s| s.parse::<u32>().ok());
-                                let dns_qry = layers.get("dns.qry.name").and_then(|v| v.as_str());
-
-                                let _ = insert_stmt.execute(params![
-                                    epoch, ip_src, ip_dst, tcp_src, tcp_dst,
-                                    udp_src, udp_dst, dns_qry, raw_line.trim()
-                                ]);
-                                stored_count += 1;
-
-                                engine.ingest(Packet {
-                                    epoch: epoch.unwrap_or(0.0),
-                                    ip_src: ip_src.map(|s| s.to_string()),
-                                    ip_dst: ip_dst.map(|s| s.to_string()),
-                                    tcp_src_port: tcp_src,
-                                    tcp_dst_port: tcp_dst,
-                                    udp_src_port: udp_src,
-                                    udp_dst_port: udp_dst,
-                                    dns_query: dns_qry.map(|s| s.to_string()),
-                                });
+                            let layers = val.get("_source")
+                                .and_then(|s| s.get("layers"))
+                                .or_else(|| val.get("layers"))
+                                .and_then(|l| l.as_object());
+                            let flat = if layers.is_none() { val.as_object() } else { None };
+                            // Debug: print first few lines to diagnose format
+                            if stored_count == 0 && packet_count <= 3 {
+                                eprintln!("[DEBUG] packet {} keys: {:?}", packet_count, val.as_object().map(|o| o.keys().collect::<Vec<_>>()));
+                                if let Some(l) = &layers { eprintln!("[DEBUG] layers keys: {:?}", l.keys().collect::<Vec<_>>()); }
                             }
-                        }
-
-                        if packet_count % 100 == 0 {
-                            print!("\r\x1b[K  {} captured, {} stored, {} IPs, window: {}", packet_count, stored_count, engine.profiles().len(), engine.window_size());
-                            io::stdout().flush().ok();
-                        }
-
-                        // Auto-analyze
-                        if realtime && last_auto_analyze.elapsed() >= auto_interval {
-                            if engine.should_analyze() {
-                                crossterm::terminal::disable_raw_mode().ok();
-                                println!("\n\n═══ AUTO ANALYSIS ({} pkts, {} IPs) ═══", engine.packet_count(), engine.profiles().len());
-                                let findings = engine.analyze();
-                                print_findings(&findings);
-
-                                if ollama.is_available() && !findings.is_empty() {
-                                    println!("\n── AI Threat Assessment ──");
-                                    match ollama.threat_summary(&findings) {
-                                        report => println!("{}", report),
-                                    }
+                            let get_field = |name: &str| -> Option<&str> {
+                                if let Some(l) = &layers {
+                                    l.get(name).and_then(|v| v.as_str())
+                                } else if let Some(f) = &flat {
+                                    f.get(name).and_then(|v| v.as_str())
+                                } else {
+                                    None
                                 }
-                                crossterm::terminal::enable_raw_mode().ok();
-                                last_auto_analyze = std::time::Instant::now();
+                            };
+                            let epoch = get_field("frame.time_epoch").and_then(|s| s.parse::<f64>().ok());
+                            let ip_src = get_field("ip.src");
+                            let ip_dst = get_field("ip.dst");
+                            let tcp_src = get_field("tcp.srcport").and_then(|s| s.parse::<u32>().ok());
+                            let tcp_dst = get_field("tcp.dstport").and_then(|s| s.parse::<u32>().ok());
+                            let udp_src = get_field("udp.srcport").and_then(|s| s.parse::<u32>().ok());
+                            let udp_dst = get_field("udp.dstport").and_then(|s| s.parse::<u32>().ok());
+                            let dns_qry = get_field("dns.qry.name");
+
+                            let _ = insert_stmt.execute(params![
+                                epoch, ip_src, ip_dst, tcp_src, tcp_dst,
+                                udp_src, udp_dst, dns_qry, raw_line.trim()
+                            ]);
+                            stored_count += 1;
+
+                            engine.ingest(Packet {
+                                epoch: epoch.unwrap_or(0.0),
+                                ip_src: ip_src.map(|s| s.to_string()),
+                                ip_dst: ip_dst.map(|s| s.to_string()),
+                                tcp_src_port: tcp_src,
+                                tcp_dst_port: tcp_dst,
+                                udp_src_port: udp_src,
+                                udp_dst_port: udp_dst,
+                                dns_query: dns_qry.map(|s| s.to_string()),
+                            });
+                        }
+                    }
+
+                    if packet_count % 100 == 0 {
+                        print!("\r\x1b[K  {} captured, {} stored, {} IPs, window: {}", packet_count, stored_count, engine.profiles().len(), engine.window_size());
+                        io::stdout().flush().ok();
+                    }
+
+                    // Auto-analyze
+                    if realtime && last_auto_analyze.elapsed() >= auto_interval {
+                        if engine.should_analyze() {
+                            crossterm::terminal::disable_raw_mode().ok();
+                            println!("\n\n═══ AUTO ANALYSIS ({} pkts, {} IPs) ═══", engine.packet_count(), engine.profiles().len());
+                            let findings = engine.analyze();
+                            print_findings(&findings);
+
+                            if ollama.is_available() && !findings.is_empty() {
+                                println!("\n── AI Threat Assessment ──");
+                                match ollama.threat_summary(&findings) {
+                                    report => println!("{}", report),
+                                }
                             }
+                            crossterm::terminal::enable_raw_mode().ok();
+                            last_auto_analyze = std::time::Instant::now();
                         }
                     }
                 }
