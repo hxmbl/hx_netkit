@@ -256,6 +256,8 @@ fn run_capture(interface: &str, filter: Option<&str>, output: Option<&str>, real
             match line_result {
                 Ok(raw_line) => {
                     if raw_line.trim().is_empty() { continue; }
+                    // Skip ES bulk action lines ({"index":{...}} or {"delete":{...}})
+                    if raw_line.contains("\"index\"") && !raw_line.contains("\"_source\"") { continue; }
                     packet_count += 1;
 
                     if ingestion_enabled {
@@ -265,10 +267,15 @@ fn run_capture(interface: &str, filter: Option<&str>, output: Option<&str>, real
                                 .or_else(|| val.get("layers"))
                                 .and_then(|l| l.as_object());
                             let flat = if layers.is_none() { val.as_object() } else { None };
-                            // Debug: print first few lines to diagnose format
-                            if stored_count == 0 && packet_count <= 3 {
-                                eprintln!("[DEBUG] packet {} keys: {:?}", packet_count, val.as_object().map(|o| o.keys().collect::<Vec<_>>()));
-                                if let Some(l) = &layers { eprintln!("[DEBUG] layers keys: {:?}", l.keys().collect::<Vec<_>>()); }
+                            // Debug: print first few non-index lines to diagnose format
+                            if stored_count == 0 && !raw_line.contains("\"index\"") {
+                                eprintln!("[DEBUG] doc line keys: {:?}", val.as_object().map(|o| o.keys().collect::<Vec<_>>()));
+                                if let Some(s) = val.get("_source") {
+                                    eprintln!("[DEBUG] _source keys: {:?}", s.as_object().map(|o| o.keys().collect::<Vec<_>>()));
+                                    if let Some(l) = s.get("layers") {
+                                        eprintln!("[DEBUG] layers keys: {:?}", l.as_object().map(|o| o.keys().collect::<Vec<_>>()));
+                                    }
+                                }
                             }
                             let get_field = |name: &str| -> Option<&str> {
                                 if let Some(l) = &layers {
