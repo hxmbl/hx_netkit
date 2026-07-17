@@ -112,6 +112,7 @@ enum Commands {
     Ask {
         #[arg(short, long)]
         db: PathBuf,
+        #[arg(short, long)]
         question: String,
         #[arg(long, default_value = "qwen2.5-coder:1.5b")]
         model: String,
