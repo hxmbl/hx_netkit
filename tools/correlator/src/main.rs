@@ -24,6 +24,9 @@ struct Cli {
     /// Skip AI (Ollama) — offline mode only
     #[arg(long)]
     no_ai: bool,
+    /// Fast scan — quicker nmap (no OS/version detection, top ports only)
+    #[arg(long)]
+    fast: bool,
     /// Target CIDR to scan with nmap (e.g. 192.168.1.0/24)
     #[arg(long)]
     target: Option<String>,
@@ -1386,7 +1389,13 @@ fn main() {
             if Command::new("nmap").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_err() {
                 eprintln!("[Warning] nmap not found — skipping scan. Install: brew install nmap");
             } else {
-                let args = vec!["-sV", "-O", "-sC", "--open", "-oX", "-", "-T4", target.as_str()];
+                let args = if cli.fast {
+                    // Fast: SYN scan, top 100 ports, no OS/version detection
+                    vec!["-sS", "--top-ports", "100", "--open", "-oX", "-", "-T4", "--min-rate", "1000", target.as_str()]
+                } else {
+                    // Thorough: version + OS + scripts
+                    vec!["-sV", "-O", "-sC", "--open", "-oX", "-", "-T4", target.as_str()]
+                };
                 let output = Command::new("sudo").arg("nmap").args(&args).output().expect("Failed to run nmap");
                 let xml_str = String::from_utf8_lossy(&output.stdout);
 
