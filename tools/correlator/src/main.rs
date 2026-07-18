@@ -1225,44 +1225,36 @@ fn format_context_for_ai(ctx: &NetworkContext) -> String {
     if !ctx.devices.is_empty() {
         parts.push(format!("## Known Devices ({})\n{}", ctx.devices.len(),
             ctx.devices.iter().map(|(ip, mac, hostname, vendor, os, ports)| {
-                format!("{} | MAC: {} | Host: {} | Vendor: {} | OS: {} | Ports: {}",
+                format!("{} | {} | {} | Ports: {}",
                     ip,
                     mac.as_deref().unwrap_or("?"),
-                    hostname.as_deref().unwrap_or("?"),
-                    vendor.as_deref().unwrap_or("?"),
-                    os.as_deref().unwrap_or("?"),
+                    hostname.as_deref().unwrap_or("unknown"),
                     if ports.is_empty() { "none" } else { ports })
             }).collect::<Vec<_>>().join("\n")));
     }
 
     // Stats
     let total_dns: usize = ctx.profiles.values().map(|p| p.dns_domains.len()).sum();
-    parts.push(format!("## Traffic Stats\n{} packets, {} unique IPs, {} DNS domains, {} findings",
+    parts.push(format!("## Stats\n{} packets, {} IPs, {} DNS, {} findings",
         ctx.packet_count, ctx.profiles.len(), total_dns, ctx.findings.len()));
 
-    // Top profiles
+    // Top talkers (top 10 only)
     let mut profiles: Vec<_> = ctx.profiles.values().collect();
     profiles.sort_by(|a, b| b.packet_count.cmp(&a.packet_count));
     if !profiles.is_empty() {
-        parts.push(format!("## Top IPs\n{}",
-            profiles.iter().take(20).map(|p| {
-                let dns = if p.dns_domains.is_empty() { String::new() } else { format!(", dns: {}", p.dns_domains.keys().take(5).cloned().collect::<Vec<_>>().join(",")) };
-                let ports = if p.dest_ports.is_empty() { String::new() } else { format!(", ports: {}", p.dest_ports.iter().take(5).map(|(port, cnt)| format!("{}/{}", port, cnt)).collect::<Vec<_>>().join(",")) };
-                format!("{}: {} pkts ({}↑ {}↓){}{}", p.ip, p.packet_count, p.outbound_count, p.inbound_count, dns, ports)
+        parts.push(format!("## Top Talkers\n{}",
+            profiles.iter().take(10).map(|p| {
+                let dns = if p.dns_domains.is_empty() { String::new() } else { format!(", dns:{}", p.dns_domains.keys().take(3).cloned().collect::<Vec<_>>().join(",")) };
+                format!("{}: {} pkts (↑{} ↓{}){}", p.ip, p.packet_count, p.outbound_count, p.inbound_count, dns)
             }).collect::<Vec<_>>().join("\n")));
     }
 
-    // Findings
+    // Findings (top 10 only)
     if !ctx.findings.is_empty() {
-        parts.push(format!("## Detected Findings\n{}",
-            ctx.findings.iter().take(30).map(|f|
-                format!("{} [{}] {}%: {}", f.ip, f.kind, (f.confidence * 100.0) as u32, f.detail)
+        parts.push(format!("## Findings\n{}",
+            ctx.findings.iter().take(10).map(|f|
+                format!("{} [{}] {}: {}", f.ip, f.kind, (f.confidence * 100.0) as u32, f.detail)
             ).collect::<Vec<_>>().join("\n")));
-    }
-
-    // Cross-reference
-    if !ctx.cross_ref.is_empty() {
-        parts.push(format!("## Cross-Reference\n{}", ctx.cross_ref));
     }
 
     parts.join("\n\n")
@@ -1347,7 +1339,6 @@ fn run_chat(db_path: &Path, model: &str) {
 
         match ollama.generate(&prompt) {
             Ok(response) => {
-                println!("{}", response);
                 conversation.push((question, response));
             }
             Err(e) => {

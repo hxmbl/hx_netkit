@@ -1627,14 +1627,14 @@ impl OllamaClient {
 
     pub fn generate(&self, prompt: &str) -> Result<String, String> {
         let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(120))
+            .timeout(Duration::from_secs(300))
             .build()
             .map_err(|e| e.to_string())?;
 
         let body = json!({
             "model": self.model,
             "prompt": prompt,
-            "stream": false,
+            "stream": true,
             "options": {
                 "temperature": 0.3,
                 "num_predict": 2048,
@@ -1646,8 +1646,35 @@ impl OllamaClient {
             .send()
             .map_err(|e| e.to_string())?;
 
-        let data: Value = resp.json().map_err(|e| e.to_string())?;
-        Ok(data["response"].as_str().unwrap_or("(no response)").to_string())
+        use std::io::{BufRead, Write};
+        let mut full_response = String::new();
+        let mut reader = std::io::BufReader::new(resp);
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            match reader.read_line(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if let Ok(chunk) = serde_json::from_str::<Value>(&buf) {
+                        if let Some(token) = chunk["response"].as_str() {
+                            print!("{}", token);
+                            std::io::stdout().flush().ok();
+                            full_response.push_str(token);
+                        }
+                        if chunk["done"].as_bool().unwrap_or(false) {
+                            break;
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        println!();
+        if full_response.is_empty() {
+            Err("Empty response from Ollama".into())
+        } else {
+            Ok(full_response)
+        }
     }
 
     pub fn analyze_findings(&self, findings: &[Finding], profiles: &HashMap<String, IpProfile>) -> String {
