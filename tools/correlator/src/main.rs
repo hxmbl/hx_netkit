@@ -293,65 +293,87 @@ fn parse_nmap_xml(xml: &str, conn: &Connection, scan_time: f64) -> String {
     let mut current_hostname: Option<String> = None;
     let mut current_os: Option<String> = None;
     let mut current_vendor: Option<String> = None;
+    let mut current_state: Option<String> = None;
     let mut ports: Vec<String> = Vec::new();
+    let mut in_host = false;
+    let mut in_ports = false;
 
-    // Simple XML parsing (no dependency needed)
     for line in xml.lines() {
         let trimmed = line.trim();
 
-        // Host start
-        if trimmed.contains("<host ") && trimmed.contains("addr=") {
-            // Extract addr
-            if let Some(start) = trimmed.find("addr=\"") {
-                let rest = &trimmed[start + 6..];
+        // <host ...> — start of host block
+        if trimmed.starts_with("<host ") {
+            // Flush previous host before starting new one
+            if in_host {
+                if let Some(ip) = &current_ip {
+                    let ports_str = ports.join(", ");
+                    upsert_device(conn, ip, current_mac.as_deref(), current_hostname.as_deref(),
+                                  current_vendor.as_deref(), current_os.as_deref(), &ports_str, scan_time);
+                    summary_lines.push(format!("{} ({}) — {} [{}]", ip,
+                        current_hostname.as_deref().unwrap_or("unknown"),
+                        current_os.as_deref().unwrap_or("OS unknown"),
+                        if ports_str.is_empty() { "no open ports".into() } else { ports_str }));
+                }
+            }
+            in_host = true;
+            current_ip = None;
+            current_mac = None;
+            current_hostname = None;
+            current_os = None;
+            current_vendor = None;
+            current_state = None;
+            ports.clear();
+            in_ports = false;
+        }
+
+        if !in_host { continue; }
+
+        // <status state="up"/>
+        if trimmed.starts_with("<status ") {
+            if let Some(start) = trimmed.find("state=\"") {
+                let rest = &trimmed[start + 7..];
                 if let Some(end) = rest.find('"') {
-                    let addr = &rest[..end];
-                    if let Some(start2) = trimmed.find("addrtype=\"") {
-                        let rest2 = &trimmed[start2 + 10..];
-                        if let Some(end2) = rest2.find('"') {
-                            let addr_type = &rest2[..end2];
-                            if addr_type == "ipv4" {
-                                // Flush previous host
-                                if let Some(ip) = &current_ip {
-                                    let ports_str = ports.join(", ");
-                                    upsert_device(conn, ip, current_mac.as_deref(), current_hostname.as_deref(),
-                                                  current_vendor.as_deref(), current_os.as_deref(), &ports_str, scan_time);
-                                    summary_lines.push(format!("{} ({}) — {} [{}]", ip,
-                                        current_hostname.as_deref().unwrap_or("unknown"),
-                                        current_os.as_deref().unwrap_or("OS unknown"),
-                                        if ports_str.is_empty() { "no open ports".into() } else { ports_str }));
-                                }
-                                current_ip = Some(addr.to_string());
-                                current_mac = None;
-                                current_hostname = None;
-                                current_os = None;
-                                current_vendor = None;
-                                ports.clear();
-                            }
-                        }
-                    }
+                    current_state = Some(rest[..end].to_string());
                 }
             }
         }
 
-        // MAC address
-        if trimmed.contains("<address ") && trimmed.contains("addrtype=\"mac\"") {
+        // <address addr="192.168.1.1" addrtype="ipv4"/>
+        // <address addr="AA:BB:CC:DD:EE:FF" addrtype="mac" vendor="..."/>
+        if trimmed.starts_with("<address ") {
+            let mut addr_val = None;
+            let mut addr_type = None;
+            let mut vendor_val = None;
             if let Some(start) = trimmed.find("addr=\"") {
                 let rest = &trimmed[start + 6..];
                 if let Some(end) = rest.find('"') {
-                    current_mac = Some(rest[..end].to_string());
+                    addr_val = Some(rest[..end].to_string());
+                }
+            }
+            if let Some(start) = trimmed.find("addrtype=\"") {
+                let rest = &trimmed[start + 10..];
+                if let Some(end) = rest.find('"') {
+                    addr_type = Some(rest[..end].to_string());
                 }
             }
             if let Some(start) = trimmed.find("vendor=\"") {
                 let rest = &trimmed[start + 8..];
                 if let Some(end) = rest.find('"') {
-                    current_vendor = Some(rest[..end].to_string());
+                    vendor_val = Some(rest[..end].to_string());
+                }
+            }
+            if let (Some(addr), Some(typ)) = (addr_val, addr_type) {
+                if typ == "ipv4" {
+                    current_ip = Some(addr);
+                } else if typ == "mac" {
+                    current_mac = Some(addr);
+                    current_vendor = vendor_val;
                 }
             }
         }
 
-        // Hostname
-        if trimmed.contains("<hostname name=") {
+        // <hostname name="router" type="PTR"/>
+        if trimmed.starts_with("<hostname ") {
             if let Some(start) = trimmed.find("name=\"") {
                 let rest = &trimmed[start + 6..];
                 if let Some(end) = rest.find('"') {
@@ -360,36 +382,45 @@ fn parse_nmap_xml(xml: &str, conn: &Connection, scan_time: f64) -> String {
             }
         }
 
-        // OS detection
-        if trimmed.contains("<osmatch ") {
-            if let Some(start) = trimmed.find("name=\"") {
-                let rest = &trimmed[start + 6..];
-                if let Some(end) = rest.find('"') {
-                    if current_os.is_none() {
-                        current_os = Some(rest[..end].to_string());
-                    }
-                }
-            }
-        }
+        // <ports> ... </ports>
+        if trimmed.starts_with("<ports>") { in_ports = true; }
+        if trimmed.starts_with("</ports>") { in_ports = false; }
 
-        // Port
-        if trimmed.contains("<port ") && trimmed.contains("protocol=\"tcp\"") {
+        // <port protocol="tcp" portid="80">
+        if in_ports && trimmed.starts_with("<port ") {
             let port_num = if let Some(start) = trimmed.find("portid=\"") {
                 let rest = &trimmed[start + 8..];
                 if let Some(end) = rest.find('"') { &rest[..end] } else { "?" }
             } else { "?" };
 
-            let state = if let Some(start) = trimmed.find("state=\"") {
-                let rest = &trimmed[start + 7..];
-                if let Some(end) = rest.find('"') { &rest[..end] } else { "?" }
-            } else { "?" };
+            let mut state = "unknown";
+            let mut service = "?";
 
-            let service = "?";
+            // State and service may be on following lines, but sometimes on same line
+            if let Some(start) = trimmed.find("state=\"") {
+                let rest = &trimmed[start + 7..];
+                if let Some(end) = rest.find('"') { state = &rest[..end]; }
+            }
+
             ports.push(format!("{}/{} {}", port_num, state, service));
         }
 
-        // Service name (follows port)
-        if trimmed.contains("<service ") && trimmed.contains("name=\"") {
+        // <state state="open" .../> (inside a port block)
+        if in_ports && trimmed.starts_with("<state ") {
+            if let Some(start) = trimmed.find("state=\"") {
+                let rest = &trimmed[start + 7..];
+                if let Some(end) = rest.find('"') {
+                    let state_val = &rest[..end];
+                    if let Some(last) = ports.last_mut() {
+                        // Replace the state placeholder
+                        *last = last.replacen("unknown", state_val, 1);
+                    }
+                }
+            }
+        }
+
+        // <service name="http" .../> (inside a port block)
+        if in_ports && trimmed.starts_with("<service ") {
             if let Some(start) = trimmed.find("name=\"") {
                 let rest = &trimmed[start + 6..];
                 if let Some(end) = rest.find('"') {
@@ -400,17 +431,50 @@ fn parse_nmap_xml(xml: &str, conn: &Connection, scan_time: f64) -> String {
                 }
             }
         }
+
+        // <osmatch name="Linux 5.x" .../>
+        if trimmed.starts_with("<osmatch ") {
+            if let Some(start) = trimmed.find("name=\"") {
+                let rest = &trimmed[start + 6..];
+                if let Some(end) = rest.find('"') {
+                    if current_os.is_none() {
+                        current_os = Some(rest[..end].to_string());
+                    }
+                }
+            }
+        }
+
+        // </host> — end of host block
+        if trimmed.starts_with("</host>") {
+            if let Some(ip) = &current_ip {
+                // Skip down hosts
+                if current_state.as_deref() == Some("up") || current_state.is_none() {
+                    let ports_str = ports.join(", ");
+                    upsert_device(conn, ip, current_mac.as_deref(), current_hostname.as_deref(),
+                                  current_vendor.as_deref(), current_os.as_deref(), &ports_str, scan_time);
+                    summary_lines.push(format!("{} ({}) — {} [{}]", ip,
+                        current_hostname.as_deref().unwrap_or("unknown"),
+                        current_os.as_deref().unwrap_or("OS unknown"),
+                        if ports_str.is_empty() { "no open ports".into() } else { ports_str }));
+                }
+            }
+            in_host = false;
+        }
     }
 
-    // Flush last host
-    if let Some(ip) = &current_ip {
-        let ports_str = ports.join(", ");
-        upsert_device(conn, ip, current_mac.as_deref(), current_hostname.as_deref(),
-                      current_vendor.as_deref(), current_os.as_deref(), &ports_str, scan_time);
-        summary_lines.push(format!("{} ({}) — {} [{}]", ip,
-            current_hostname.as_deref().unwrap_or("unknown"),
-            current_os.as_deref().unwrap_or("OS unknown"),
-            if ports_str.is_empty() { "no open ports".into() } else { ports_str }));
+    // Flush last host if XML didn't end with </host>
+    if in_host {
+        if let Some(ip) = &current_ip {
+            if current_state.as_deref() == Some("up") || current_state.is_none() {
+                let ports_str = ports.join(", ");
+                upsert_device(conn, ip, current_mac.as_deref(), current_hostname.as_deref(),
+                              current_vendor.as_deref(), current_os.as_deref(), &ports_str, scan_time);
+                summary_lines.push(format!("{} ({}) — {} [{}]", ip,
+                    current_hostname.as_deref().unwrap_or("unknown"),
+                    current_os.as_deref().unwrap_or("OS unknown"),
+                    if ports_str.is_empty() { "no open ports".into() } else { ports_str }));
+            }
+        }
     }
 
     summary_lines.join("\n")
@@ -1407,6 +1471,13 @@ fn main() {
 
                 if !stderr_str.is_empty() {
                     eprintln!("[nmap stderr] {}", stderr_str);
+                }
+
+                // Debug: dump first 2000 chars of raw XML
+                if cli.debug && !xml_str.is_empty() {
+                    eprintln!("[nmap] exit code: {:?}", output.status);
+                    let preview = if xml_str.len() > 2000 { &xml_str[..2000] } else { &xml_str };
+                    eprintln!("[nmap XML preview]\n{}", preview);
                 }
 
                 if xml_str.is_empty() {
