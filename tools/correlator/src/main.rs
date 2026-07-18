@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 mod correlate;
-use correlate::{Correlator, RealtimeEngine, OllamaClient, Packet, load_from_db, print_findings, print_profile};
+use correlate::{Correlator, OllamaClient, load_from_db};
 
 // ── Config ───────────────────────────────────────────────────
 
@@ -44,7 +44,6 @@ fn default_target() -> String { "192.168.1.0/24".into() }
 fn default_duration() -> u64 { 300 }
 fn default_model() -> String { "qwen2.5:0.5b".into() }
 fn default_save_path() -> PathBuf { dirs().join("correlator") }
-fn default_true() -> bool { true }
 
 fn dirs() -> PathBuf {
     std::env::var("HOME")
@@ -792,18 +791,19 @@ fn run_capture(interface: &str, target: &str, duration: u64, no_save: bool, outp
 
 fn run_chat(db_path: &Path, model: &str) {
     println!("\n═══════ NETWORK INTELLIGENCE ═══════");
-    println!("[System] Building context from {}", db_path.display());
 
-    let conn = open_db(db_path);
-    let ctx = build_network_context(db_path);
-    let context_str = format_context_for_ai(&ctx);
-
+    // Check Ollama first — don't waste time building context if unavailable
     let ollama = OllamaClient::new(model);
     if !ollama.is_available() {
-        println!("[System] Ollama not available. Entering search mode.\n");
+        println!("[System] Ollama not available. Entering search mode.");
+        println!("[System] Use / prefix for search commands: /ip, /port, /dns, /find, /devices, /stats, /help\n");
         run_search(db_path, None);
         return;
     }
+
+    println!("[System] Building context from {}", db_path.display());
+    let ctx = build_network_context(db_path);
+    let context_str = format_context_for_ai(&ctx);
 
     let system_prompt = format!(
         "You are a senior network security analyst with FULL VISIBILITY into this network. \
@@ -814,14 +814,16 @@ fn run_chat(db_path: &Path, model: &str) {
          Answer thoroughly, cross-referencing all data sources. Be specific — use actual IPs, \
          ports, hostnames, and timestamps. Don't just list findings — INTERPRET them. \
          What story does this data tell? What is normal? What is suspicious?\n\n\
+         The user can also use /search commands: /ip, /port, /dns, /find, /devices, /stats, /talkers, /recent, /connections, /services, /help\n\n\
          Be concise but thorough. Use the data, not guesses.",
         context_str
     );
 
     println!("\n[System] Chat ready. {} devices, {} packets, {} findings loaded.",
         ctx.devices.len(), ctx.packet_count, ctx.findings.len());
-    println!("[System] Type your question. 'quit' or Ctrl+C to exit.\n");
+    println!("[System] Type your question, or /help for search commands. 'quit' to exit.\n");
 
+    let conn = open_db(db_path);
     let mut conversation: Vec<(String, String)> = Vec::new();
     let mut input = String::new();
 
@@ -839,12 +841,10 @@ fn run_chat(db_path: &Path, model: &str) {
         if question.is_empty() { continue; }
         if question == "quit" || question == "exit" || question == "q" { break; }
 
-        // Check for search commands
-        if question.starts_with("ip ") || question.starts_with("port ") || question.starts_with("dns ") ||
-           question.starts_with("find ") || question.starts_with("devices") || question.starts_with("stats") ||
-           question.starts_with("talkers") || question.starts_with("recent") || question.starts_with("connections ") ||
-           question.starts_with("services ") || question.starts_with("help") {
-            search_execute(&conn, &question);
+        // /search commands go to search engine
+        if question.starts_with('/') {
+            let search_cmd = &question[1..]; // strip the /
+            search_execute(&conn, search_cmd);
             continue;
         }
 
@@ -864,7 +864,7 @@ fn run_chat(db_path: &Path, model: &str) {
             }
             Err(e) => {
                 eprintln!("\n[Error] {}", e);
-                println!("  [AI unavailable — try search commands or 'quit']");
+                println!("  [AI unavailable — try /help or 'quit']");
             }
         }
         println!();
@@ -1319,7 +1319,10 @@ fn search_execute(conn: &Connection, query: &str) {
         }
         "port" | "p" => {
             if arg.is_empty() { println!("Usage: port <number>"); return; }
-            let port: i32 = arg.parse().unwrap_or(0);
+            let port: i32 = match arg.parse() {
+                Ok(p) if p > 0 && p <= 65535 => p,
+                _ => { println!("Invalid port: '{}'. Must be 1-65535.", arg); return; }
+            };
             let mut stmt = conn.prepare(
                 "SELECT epoch, ip_src, ip_dst FROM packets WHERE tcp_dst_port = ?1 OR udp_dst_port = ?1 OR tcp_src_port = ?1 OR udp_src_port = ?1 ORDER BY epoch DESC LIMIT 100"
             ).unwrap();
@@ -1420,6 +1423,8 @@ fn search_execute(conn: &Connection, query: &str) {
         "connections" | "conn" => {
             if arg.is_empty() { println!("Usage: connections <ip>"); return; }
             let pattern = format!("%{}%", arg);
+
+            // Outbound connections
             let mut stmt = conn.prepare(
                 "SELECT ip_dst, COUNT(*) as cnt FROM packets WHERE ip_src LIKE ?1 GROUP BY ip_dst ORDER BY cnt DESC LIMIT 20"
             ).unwrap();
@@ -1427,7 +1432,18 @@ fn search_execute(conn: &Connection, query: &str) {
             println!("{} connects to:", arg);
             for row in rows {
                 let (ip, count): (String, u64) = row.unwrap();
-                println!("  {} (×{})", ip, count);
+                println!("  → {} (×{})", ip, count);
+            }
+
+            // Inbound connections
+            let mut stmt = conn.prepare(
+                "SELECT ip_src, COUNT(*) as cnt FROM packets WHERE ip_dst LIKE ?1 GROUP BY ip_src ORDER BY cnt DESC LIMIT 20"
+            ).unwrap();
+            let rows = stmt.query_map(params![pattern], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+            println!("\n{} connects from:", arg);
+            for row in rows {
+                let (ip, count): (String, u64) = row.unwrap();
+                println!("  ← {} (×{})", ip, count);
             }
         }
         "services" | "svc" => {
@@ -1525,7 +1541,12 @@ fn main() {
                 })
             });
             let mdl = model.as_deref().unwrap_or(&config.ai.model);
-            run_chat(&db_path, mdl);
+            if !config.ai.enabled {
+                println!("[System] AI disabled in config. Entering search mode.");
+                run_search(&db_path, None);
+            } else {
+                run_chat(&db_path, mdl);
+            }
         }
         Commands::Scan { target, output } => {
             let tgt = target.unwrap_or_else(|| {
