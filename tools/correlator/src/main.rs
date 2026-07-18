@@ -1403,6 +1403,18 @@ fn main() {
                     .stdin(std::process::Stdio::inherit())
                     .output().expect("Failed to run nmap");
                 let xml_str = String::from_utf8_lossy(&output.stdout);
+                let stderr_str = String::from_utf8_lossy(&output.stderr);
+
+                if !stderr_str.is_empty() {
+                    eprintln!("[nmap stderr] {}", stderr_str);
+                }
+
+                if xml_str.is_empty() {
+                    eprintln!("[nmap] Empty output (exit code: {:?}). nmap may need sudo.", output.status);
+                } else if !xml_str.contains("<host") {
+                    eprintln!("[nmap] XML has no <host> entries. Scan found nothing.");
+                    eprintln!("[nmap] Raw (first 500 chars): {}", &xml_str[..xml_str.len().min(500)]);
+                }
 
                 if !xml_str.is_empty() {
                     let conn = init_db(&db_path);
