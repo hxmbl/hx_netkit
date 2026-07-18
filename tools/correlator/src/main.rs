@@ -956,20 +956,48 @@ fn extract_and_run_tool(response: &str, conn: &Connection, db_path: &Path) -> Op
                 if let Some(tool) = val.get("tool").and_then(|t| t.as_str()) {
                     return match tool {
                         "nmap" => {
-                            let target = val.get("target").and_then(|t| t.as_str()).unwrap_or("192.168.1.0/24");
+                            let target = val.get("target").and_then(|t| t.as_str()).unwrap_or("");
+                            if !is_valid_target(target) {
+                                return Some(ToolResult {
+                                    tool_name: "nmap".into(),
+                                    summary: "Invalid target".into(),
+                                    output: format!("Rejected: '{}' is not a valid IP/CIDR", target),
+                                });
+                            }
                             Some(run_tool_nmap(target))
                         }
                         "tshark" => {
                             let filter = val.get("filter").and_then(|t| t.as_str()).unwrap_or("");
-                            let duration = val.get("duration").and_then(|d| d.as_u64()).unwrap_or(10);
+                            if !is_valid_bpf(filter) {
+                                return Some(ToolResult {
+                                    tool_name: "tshark".into(),
+                                    summary: "Invalid filter".into(),
+                                    output: format!("Rejected: '{}' contains invalid characters", filter),
+                                });
+                            }
+                            let duration = val.get("duration").and_then(|d| d.as_u64()).unwrap_or(10).min(60);
                             Some(run_tool_tshark(filter, duration, db_path))
                         }
                         "sql" => {
                             let query = val.get("query").and_then(|q| q.as_str()).unwrap_or("");
+                            if !is_safe_sql(query) {
+                                return Some(ToolResult {
+                                    tool_name: "sql".into(),
+                                    summary: "Rejected unsafe SQL".into(),
+                                    output: "Only SELECT queries are allowed.".into(),
+                                });
+                            }
                             Some(run_tool_sql(query, conn))
                         }
                         "search" => {
                             let query = val.get("query").and_then(|q| q.as_str()).unwrap_or("");
+                            if !is_safe_search(query) {
+                                return Some(ToolResult {
+                                    tool_name: "search".into(),
+                                    summary: "Invalid search".into(),
+                                    output: "Search contains invalid characters.".into(),
+                                });
+                            }
                             Some(run_tool_search(query, conn))
                         }
                         _ => None,
@@ -979,6 +1007,34 @@ fn extract_and_run_tool(response: &str, conn: &Connection, db_path: &Path) -> Op
         }
     }
     None
+}
+
+// ── Input Validation ─────────────────────────────────────────
+
+fn is_valid_target(target: &str) -> bool {
+    if target.is_empty() || target.len() > 64 { return false; }
+    // Only allow: digits, dots, slashes, commas, hyphens, spaces (for ranges)
+    target.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '/' || c == ',' || c == '-' || c == ' ')
+}
+
+fn is_valid_bpf(filter: &str) -> bool {
+    if filter.is_empty() || filter.len() > 256 { return false; }
+    // Reject shell metacharacters
+    let dangerous = [';', '|', '&', '`', '$', '(', ')', '{', '}', '<', '>', '\n', '\r', '"', '\''];
+    !filter.chars().any(|c| dangerous.contains(&c))
+}
+
+fn is_safe_sql(query: &str) -> bool {
+    let upper = query.trim().to_uppercase();
+    // Only allow SELECT, WITH, SHOW, EXPLAIN
+    upper.starts_with("SELECT") || upper.starts_with("WITH") ||
+    upper.starts_with("SHOW") || upper.starts_with("EXPLAIN")
+}
+
+fn is_safe_search(query: &str) -> bool {
+    if query.is_empty() || query.len() > 128 { return false; }
+    let dangerous = [';', '|', '&', '`', '$', '(', ')', '{', '}', '<', '>', '\n', '\r'];
+    !query.chars().any(|c| dangerous.contains(&c))
 }
 
 fn run_tool_nmap(target: &str) -> ToolResult {
@@ -1049,6 +1105,29 @@ fn run_tool_tshark(filter: &str, duration: u64, db_path: &Path) -> ToolResult {
 
 fn run_tool_sql(query: &str, conn: &Connection) -> ToolResult {
     println!("\n  [Tool] Running SQL: {}", query);
+
+    // Additional safety: block multiple statements
+    if query.contains(';') {
+        return ToolResult {
+            tool_name: "sql".into(),
+            summary: "Rejected multi-statement query".into(),
+            output: "Only single SELECT queries are allowed.".into(),
+        };
+    }
+
+    // Block dangerous keywords even in SELECT
+    let upper = query.to_uppercase();
+    let blocked = ["DROP", "DELETE", "UPDATE", "INSERT", "ALTER", "CREATE", "TRUNCATE", "EXEC", "EXECUTE", "UNION", "INTO", "LOAD", "INFILE", "OUTFILE"];
+    for kw in blocked {
+        if upper.contains(kw) {
+            return ToolResult {
+                tool_name: "sql".into(),
+                summary: "Rejected query with blocked keyword".into(),
+                output: format!("Keyword '{}' is not allowed.", kw),
+            };
+        }
+    }
+
     match conn.prepare(query) {
         Ok(mut stmt) => {
             let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
