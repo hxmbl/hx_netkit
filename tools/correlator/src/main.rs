@@ -31,19 +31,26 @@ struct Config {
     ai: AiConfig,
 }
 
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 struct AiConfig {
     #[serde(default = "default_model")]
     model: String,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     enabled: bool,
+}
+
+impl Default for AiConfig {
+    fn default() -> Self {
+        Self { model: default_model(), enabled: true }
+    }
 }
 
 fn default_interface() -> String { "en1".into() }
 fn default_target() -> String { "192.168.1.0/24".into() }
 fn default_duration() -> u64 { 300 }
-fn default_model() -> String { "qwen2.5:0.5b".into() }
+fn default_model() -> String { "qwen2.5-coder:1.5b".into() }
 fn default_save_path() -> PathBuf { dirs().join("correlator") }
+fn default_true() -> bool { true }
 
 fn dirs() -> PathBuf {
     std::env::var("HOME")
@@ -806,16 +813,28 @@ fn run_chat(db_path: &Path, model: &str) {
     let context_str = format_context_for_ai(&ctx);
 
     let system_prompt = format!(
-        "You are a senior network security analyst with FULL VISIBILITY into this network. \
-         You have been given complete data from nmap scanning and live packet capture.\n\n\
+        "You are a network analyst. Analyze captured packet data and nmap results to produce actionable intelligence.\n\n\
          {}\n\n\
-         ## Your Role\n\
-         You are an interactive analyst. The user will ask you questions about this network. \
-         Answer thoroughly, cross-referencing all data sources. Be specific — use actual IPs, \
-         ports, hostnames, and timestamps. Don't just list findings — INTERPRET them. \
-         What story does this data tell? What is normal? What is suspicious?\n\n\
-         The user can also use /search commands: /ip, /port, /dns, /find, /devices, /stats, /talkers, /recent, /connections, /services, /help\n\n\
-         Be concise but thorough. Use the data, not guesses.",
+         TASKS:\n\
+         1. Identify each device: IP, MAC vendor, likely device type, role on network.\n\
+         2. Summarize open ports ONCE per device in the inventory, not repeated throughout.\n\
+         3. Map conversation flows: who talks to whom, volume, protocol used.\n\
+         4. Calculate traffic volumes to find bandwidth hogs.\n\
+         5. Identify device pairs communicating heavily (camera+NVR, hub+sensors, etc.).\n\
+         6. Cross-reference findings: if nmap OS fingerprint contradicts MAC vendor, flag it.\n\
+         7. Flag anomalies: unexpected traffic volume, unusual ports for device type, external communications.\n\n\
+         OUTPUT FORMAT:\n\
+         - Device inventory (IP | MAC | Vendor | Device Type | Ports | Role)\n\
+         - Conversation matrix (src → dst | volume | protocol)\n\
+         - Top talkers by bandwidth\n\
+         - Anomalies or findings\n\
+         - Network topology summary\n\n\
+         RULES:\n\
+         - Never repeat the same information in multiple sections.\n\
+         - Be specific with numbers (MB transferred, packets/sec).\n\
+         - Don't state the obvious ('devices are communicating').\n\
+         - If you can't determine something, say so.\n\
+         - The user can use /search commands: /ip, /port, /dns, /find, /devices, /stats, /talkers, /recent, /connections, /services, /help",
         context_str
     );
 
