@@ -45,6 +45,9 @@ struct Cli {
     /// Resume from an existing database (skip scan+capture, go straight to chat)
     #[arg(short, long)]
     resume: Option<PathBuf>,
+    /// Print raw tshark JSON to stderr for debugging
+    #[arg(long)]
+    debug: bool,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -1499,6 +1502,25 @@ fn main() {
                                     .or_else(|| val.get("layers"))
                                     .and_then(|l| l.as_object());
                                 let flat = if layers.is_none() { val.as_object() } else { None };
+
+                                // Debug: print first 3 parsed packets
+                                if cli.debug && stored_count < 3 {
+                                    eprintln!("[DEBUG] ── packet {} ──", stored_count);
+                                    eprintln!("[DEBUG] raw: {}", &raw_line[..raw_line.len().min(500)]);
+                                    if let Some(l) = &layers {
+                                        eprintln!("[DEBUG] layers keys: {:?}", l.keys().collect::<Vec<_>>());
+                                        if let Some(f) = l.get("frame") { eprintln!("[DEBUG] frame: {:?}", f); }
+                                        if let Some(f) = l.get("ip") { eprintln!("[DEBUG] ip: {:?}", f); }
+                                        if let Some(f) = l.get("tcp") { eprintln!("[DEBUG] tcp: {:?}", f); }
+                                        if let Some(f) = l.get("dns") { eprintln!("[DEBUG] dns: {:?}", f); }
+                                    } else if let Some(f) = &flat {
+                                        eprintln!("[DEBUG] flat keys: {:?}", f.keys().collect::<Vec<_>>());
+                                    } else {
+                                        eprintln!("[DEBUG] NO layers or flat found!");
+                                        eprintln!("[DEBUG] top-level keys: {:?}", val.as_object().map(|o| o.keys().collect::<Vec<_>>()));
+                                    }
+                                }
+
                                 let get_field = |name: &str| -> Option<&str> {
                                     if let Some(l) = &layers {
                                         l.get(name).and_then(|v| v.as_str())
