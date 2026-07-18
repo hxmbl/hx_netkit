@@ -48,7 +48,7 @@ impl Default for AiConfig {
 fn default_interface() -> String { "en1".into() }
 fn default_target() -> String { "192.168.1.0/24".into() }
 fn default_duration() -> u64 { 300 }
-fn default_model() -> String { "qwen2.5-coder:1.5b".into() }
+fn default_model() -> String { "mistral".into() }
 fn default_save_path() -> PathBuf { dirs().join("correlator") }
 fn default_true() -> bool { true }
 
@@ -813,42 +813,46 @@ fn run_chat(db_path: &Path, model: &str) {
     let context_str = format_context_for_ai(&ctx);
 
     let system_prompt = format!(
-        "You are a network analyst with FULL VISIBILITY into this network.\n\n\
+        "You are a network analysis system with full access to this network. You are NOT a chatbot.\n\
+         You have: a database of captured packets, nmap scan results, device inventory, and tools to run further analysis.\n\n\
          {}\n\n\
-         ## TOOLS — You can run commands by outputting a JSON block.\n\
-         When you need more data, output EXACTLY this format (no markdown, no code fences):\n\
+         ## YOUR CAPABILITIES\n\
+         You can execute commands and get real results:\n\
+         - nmap: Scan any IP for open ports, OS detection, services\n\
+         - tshark: Capture live traffic with filters\n\
+         - sql: Query the packet database directly\n\
+         - search: Look up IPs, ports, DNS, connections\n\n\
+         ## INTERNET TOOLS (only when user asks for research)\n\
+         - webfetch: Fetch a URL to research vulnerabilities, CVEs, device docs\n\
+         - websearch: Search the internet for device info, vulnerabilities, exploits\n\
+         USE THESE ONLY when the user explicitly asks you to research something.\n\n\
+         ## TOOLS — Output EXACTLY one JSON block when you need data:\n\
          {{\"tool\": \"nmap\", \"target\": \"192.168.1.60\"}}\n\
          {{\"tool\": \"tshark\", \"filter\": \"host 192.168.1.60\", \"duration\": 10}}\n\
          {{\"tool\": \"sql\", \"query\": \"SELECT * FROM packets WHERE ip_src='192.168.1.60' LIMIT 10\"}}\n\
-         {{\"tool\": \"search\", \"query\": \"connections 192.168.1.60\"}}\n\n\
-         Available tools:\n\
-         - nmap: Scan a target. Args: target (IP/CIDR)\n\
-         - tshark: Capture traffic. Args: filter (BPF), duration (seconds, default 10)\n\
-         - sql: Query the database. Args: query (SQL)\n\
-         - search: Use search engine. Args: query (search command)\n\n\
-         ## RULES\n\
-         - When you need more information, use a tool FIRST before answering.\n\
-         - After receiving tool results, analyze them and respond.\n\
-         - Never fabricate data. If a tool returns empty, say so.\n\
-         - Output tool calls as raw JSON, no code fences.\n\
-         - Only ONE tool call per response.\n\
-         - If no tool is needed, respond normally.\n\n\
-         ## TASKS\n\
-         1. Identify each device: IP, MAC vendor, likely device type, role.\n\
-         2. Map conversation flows: who talks to whom, volume, protocol.\n\
-         3. Flag anomalies: unusual ports, unexpected traffic, external comms.\n\
-         4. Cross-reference nmap findings with packet capture.\n\n\
-         OUTPUT:\n\
+         {{\"tool\": \"search\", \"query\": \"connections 192.168.1.60\"}}\n\
+         {{\"tool\": \"webfetch\", \"url\": \"https://nvd.nist.gov/vuln/detail/CVE-2024-1234\"}}\n\
+         {{\"tool\": \"websearch\", \"query\": \"Sonos port 1443 vulnerability\"}}\n\n\
+         ## PERSONALITY\n\
+         - Be curious. When you find something interesting, dig deeper.\n\
+         - Investigate anomalies. Follow leads. Don't just list — explore.\n\
+         - If you don't know what a device is, say so AND try to find out.\n\
+         - Be direct. No apologies, no disclaimers, no filler.\n\
+         - You are an analyst with tools, not a language model.\n\n\
+         ## OUTPUT FORMAT\n\
          - Device inventory (IP | MAC | Vendor | Type | Ports | Role)\n\
          - Conversation flows (src → dst | volume | protocol)\n\
-         - Anomalies with severity\n\
-         - Topology summary",
+         - Anomalies with severity and exploit potential\n\
+         - Topology summary\n\
+         - Recommended actions with specific commands",
         context_str
     );
 
     println!("\n[System] Chat ready. {} devices, {} packets, {} findings loaded.",
         ctx.devices.len(), ctx.packet_count, ctx.findings.len());
-    println!("[System] Type your question. AI can run nmap, tshark, SQL queries.\n");
+    println!("[System] Tools: nmap, tshark, sql, search, webfetch, websearch");
+    println!("[System] Ask: 'scan 192.168.1.60', 'who does X talk to', 'research this vulnerability'");
+    println!("[System] Internet tools activate only when you ask for further research.\n");
 
     let conn = open_db(db_path);
     let mut conversation: Vec<(String, String)> = Vec::new();
@@ -999,6 +1003,28 @@ fn extract_and_run_tool(response: &str, conn: &Connection, db_path: &Path) -> Op
                                 });
                             }
                             Some(run_tool_search(query, conn))
+                        }
+                        "webfetch" => {
+                            let url = val.get("url").and_then(|u| u.as_str()).unwrap_or("");
+                            if !url.starts_with("http://") && !url.starts_with("https://") {
+                                return Some(ToolResult {
+                                    tool_name: "webfetch".into(),
+                                    summary: "Invalid URL".into(),
+                                    output: "URL must start with http:// or https://".into(),
+                                });
+                            }
+                            Some(run_tool_webfetch(url))
+                        }
+                        "websearch" => {
+                            let query = val.get("query").and_then(|q| q.as_str()).unwrap_or("");
+                            if query.is_empty() || query.len() > 200 {
+                                return Some(ToolResult {
+                                    tool_name: "websearch".into(),
+                                    summary: "Invalid query".into(),
+                                    output: "Query must be 1-200 characters.".into(),
+                                });
+                            }
+                            Some(run_tool_websearch(query))
                         }
                         _ => None,
                     }
@@ -1207,6 +1233,131 @@ fn run_tool_search(query: &str, conn: &Connection) -> ToolResult {
         summary: format!("Search '{}' returned {} results", query, output.len()),
         output: output.join("\n"),
     }
+}
+
+fn run_tool_webfetch(url: &str) -> ToolResult {
+    println!("\n  [Tool] Fetching {}...", url);
+    match reqwest::blocking::get(url) {
+        Ok(resp) => {
+            let status = resp.status();
+            let text = resp.text().unwrap_or_default();
+            // Truncate to ~4000 chars for LLM context
+            let truncated = if text.len() > 4000 { &text[..4000] } else { &text };
+            ToolResult {
+                tool_name: "webfetch".into(),
+                summary: format!("Fetched {} (status: {}, {} bytes)", url, status, text.len()),
+                output: truncated.to_string(),
+            }
+        }
+        Err(e) => ToolResult {
+            tool_name: "webfetch".into(),
+            summary: "Fetch failed".into(),
+            output: format!("Error: {}", e),
+        },
+    }
+}
+
+fn run_tool_websearch(query: &str) -> ToolResult {
+    println!("\n  [Tool] Searching web: {}...", query);
+    // Use DuckDuckGo lite for simple web search
+    let search_url = format!("https://lite.duckduckgo.com/lite/?q={}", urlencoding::encode(query));
+    match reqwest::blocking::get(&search_url) {
+        Ok(resp) => {
+            let html = resp.text().unwrap_or_default();
+            // Extract text content from the simple HTML
+            let results = extract_search_results(&html);
+            if results.is_empty() {
+                ToolResult {
+                    tool_name: "websearch".into(),
+                    summary: format!("No results for '{}'", query),
+                    output: "No search results found. Try different keywords.".into(),
+                }
+            } else {
+                ToolResult {
+                    tool_name: "websearch".into(),
+                    summary: format!("Found {} results for '{}'", results.len(), query),
+                    output: results.join("\n\n"),
+                }
+            }
+        }
+        Err(e) => ToolResult {
+            tool_name: "websearch".into(),
+            summary: "Search failed".into(),
+            output: format!("Error: {}", e),
+        },
+    }
+}
+
+fn extract_search_results(html: &str) -> Vec<String> {
+    let mut results = Vec::new();
+    // Simple extraction: find <a> tags with href and text
+    let mut in_result = false;
+    let mut current_title = String::new();
+    let mut current_url = String::new();
+    let mut current_snippet = String::new();
+
+    for line in html.lines() {
+        let trimmed = line.trim();
+        // Look for result links
+        if trimmed.contains("result__a") || trimmed.contains("result-link") {
+            if let Some(href_start) = trimmed.find("href=\"") {
+                let rest = &trimmed[href_start + 6..];
+                if let Some(href_end) = rest.find('"') {
+                    current_url = rest[..href_end].to_string();
+                    in_result = true;
+                }
+            }
+            // Extract title text
+            if let Some(text_start) = trimmed.find('>') {
+                let text = &trimmed[text_start + 1..];
+                if let Some(text_end) = text.find('<') {
+                    current_title = text[..text_end].trim().to_string();
+                }
+            }
+        }
+        // Look for snippet
+        if in_result && (trimmed.contains("result__snippet") || trimmed.contains("result-snippet")) {
+            if let Some(text_start) = trimmed.find('>') {
+                let text = &trimmed[text_start + 1..];
+                if let Some(text_end) = text.find('<') {
+                    current_snippet = text[..text_end].trim().to_string();
+                }
+            }
+        }
+        // End of result
+        if in_result && !current_title.is_empty() && (!current_snippet.is_empty() || trimmed.contains("</td>")) {
+            if !current_url.is_empty() || !current_title.is_empty() {
+                results.push(format!("{} {}\n{}", current_title, current_url, current_snippet));
+            }
+            current_title = String::new();
+            current_url = String::new();
+            current_snippet = String::new();
+            in_result = false;
+            if results.len() >= 5 { break; }
+        }
+    }
+
+    // Catch last result
+    if in_result && !current_title.is_empty() {
+        results.push(format!("{} {}\n{}", current_title, current_url, current_snippet));
+    }
+
+    // Fallback: if no structured results, grab any text content
+    if results.is_empty() {
+        let cleaned = html.replace("<script>", "").replace("</script>", "")
+            .replace("<style>", "").replace("</style>", "");
+        let text_only = cleaned
+            .split(|c: char| c == '<' || c == '>')
+            .map(|s| s.trim())
+            .filter(|s| s.len() > 20 && !s.starts_with("http"))
+            .take(5)
+            .collect::<Vec<_>>();
+        if !text_only.is_empty() {
+            results.push(text_only.join("\n"));
+        }
+    }
+
+    results
 }
 
 // ── Context Builders ─────────────────────────────────────────
