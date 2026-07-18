@@ -1522,10 +1522,34 @@ fn main() {
                                 }
 
                                 let get_field = |name: &str| -> Option<&str> {
+                                    // Try both formats: tshark <4.6 uses dots (ip.src), 4.6+ uses underscores (ip_src)
+                                    // Also try as array value: ["value"] → "value"
+                                    let alt = name.replace('.', "_");
+                                    let names: [&str; 2] = [name, &alt];
                                     if let Some(l) = &layers {
-                                        l.get(name).and_then(|v| v.as_str())
+                                        for n in &names {
+                                            if let Some(v) = l.get(*n) {
+                                                if let Some(s) = v.as_str() { return Some(s); }
+                                                if let Some(arr) = v.as_array() {
+                                                    if let Some(first) = arr.first() {
+                                                        if let Some(s) = first.as_str() { return Some(s); }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        None
                                     } else if let Some(f) = &flat {
-                                        f.get(name).and_then(|v| v.as_str())
+                                        for n in &names {
+                                            if let Some(v) = f.get(*n) {
+                                                if let Some(s) = v.as_str() { return Some(s); }
+                                                if let Some(arr) = v.as_array() {
+                                                    if let Some(first) = arr.first() {
+                                                        if let Some(s) = first.as_str() { return Some(s); }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        None
                                     } else {
                                         None
                                     }
