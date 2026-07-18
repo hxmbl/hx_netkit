@@ -813,34 +813,42 @@ fn run_chat(db_path: &Path, model: &str) {
     let context_str = format_context_for_ai(&ctx);
 
     let system_prompt = format!(
-        "You are a network analyst. Analyze captured packet data and nmap results to produce actionable intelligence.\n\n\
+        "You are a network analyst with FULL VISIBILITY into this network.\n\n\
          {}\n\n\
-         TASKS:\n\
-         1. Identify each device: IP, MAC vendor, likely device type, role on network.\n\
-         2. Summarize open ports ONCE per device in the inventory, not repeated throughout.\n\
-         3. Map conversation flows: who talks to whom, volume, protocol used.\n\
-         4. Calculate traffic volumes to find bandwidth hogs.\n\
-         5. Identify device pairs communicating heavily (camera+NVR, hub+sensors, etc.).\n\
-         6. Cross-reference findings: if nmap OS fingerprint contradicts MAC vendor, flag it.\n\
-         7. Flag anomalies: unexpected traffic volume, unusual ports for device type, external communications.\n\n\
-         OUTPUT FORMAT:\n\
-         - Device inventory (IP | MAC | Vendor | Device Type | Ports | Role)\n\
-         - Conversation matrix (src → dst | volume | protocol)\n\
-         - Top talkers by bandwidth\n\
-         - Anomalies or findings\n\
-         - Network topology summary\n\n\
-         RULES:\n\
-         - Never repeat the same information in multiple sections.\n\
-         - Be specific with numbers (MB transferred, packets/sec).\n\
-         - Don't state the obvious ('devices are communicating').\n\
-         - If you can't determine something, say so.\n\
-         - The user can use /search commands: /ip, /port, /dns, /find, /devices, /stats, /talkers, /recent, /connections, /services, /help",
+         ## TOOLS — You can run commands by outputting a JSON block.\n\
+         When you need more data, output EXACTLY this format (no markdown, no code fences):\n\
+         {{\"tool\": \"nmap\", \"target\": \"192.168.1.60\"}}\n\
+         {{\"tool\": \"tshark\", \"filter\": \"host 192.168.1.60\", \"duration\": 10}}\n\
+         {{\"tool\": \"sql\", \"query\": \"SELECT * FROM packets WHERE ip_src='192.168.1.60' LIMIT 10\"}}\n\
+         {{\"tool\": \"search\", \"query\": \"connections 192.168.1.60\"}}\n\n\
+         Available tools:\n\
+         - nmap: Scan a target. Args: target (IP/CIDR)\n\
+         - tshark: Capture traffic. Args: filter (BPF), duration (seconds, default 10)\n\
+         - sql: Query the database. Args: query (SQL)\n\
+         - search: Use search engine. Args: query (search command)\n\n\
+         ## RULES\n\
+         - When you need more information, use a tool FIRST before answering.\n\
+         - After receiving tool results, analyze them and respond.\n\
+         - Never fabricate data. If a tool returns empty, say so.\n\
+         - Output tool calls as raw JSON, no code fences.\n\
+         - Only ONE tool call per response.\n\
+         - If no tool is needed, respond normally.\n\n\
+         ## TASKS\n\
+         1. Identify each device: IP, MAC vendor, likely device type, role.\n\
+         2. Map conversation flows: who talks to whom, volume, protocol.\n\
+         3. Flag anomalies: unusual ports, unexpected traffic, external comms.\n\
+         4. Cross-reference nmap findings with packet capture.\n\n\
+         OUTPUT:\n\
+         - Device inventory (IP | MAC | Vendor | Type | Ports | Role)\n\
+         - Conversation flows (src → dst | volume | protocol)\n\
+         - Anomalies with severity\n\
+         - Topology summary",
         context_str
     );
 
     println!("\n[System] Chat ready. {} devices, {} packets, {} findings loaded.",
         ctx.devices.len(), ctx.packet_count, ctx.findings.len());
-    println!("[System] Type your question, or /help for search commands. 'quit' to exit.\n");
+    println!("[System] Type your question. AI can run nmap, tshark, SQL queries.\n");
 
     let conn = open_db(db_path);
     let mut conversation: Vec<(String, String)> = Vec::new();
@@ -862,11 +870,12 @@ fn run_chat(db_path: &Path, model: &str) {
 
         // /search commands go to search engine
         if question.starts_with('/') {
-            let search_cmd = &question[1..]; // strip the /
+            let search_cmd = &question[1..];
             search_execute(&conn, search_cmd);
             continue;
         }
 
+        // Build prompt with conversation history
         let mut prompt = format!("{}\n\n## Conversation\n", system_prompt);
         let start = conversation.len().saturating_sub(5);
         for (q, a) in &conversation[start..] {
@@ -874,22 +883,251 @@ fn run_chat(db_path: &Path, model: &str) {
         }
         prompt.push_str(&format!("User: {}\nAssistant:", question));
 
+        // Get AI response
         print!("  ");
         io::stdout().flush().ok();
 
-        match ollama.generate(&prompt) {
-            Ok(response) => {
-                conversation.push((question, response));
-            }
+        let response = match ollama.generate(&prompt) {
+            Ok(r) => r,
             Err(e) => {
                 eprintln!("\n[Error] {}", e);
                 println!("  [AI unavailable — try /help or 'quit']");
+                continue;
             }
+        };
+
+        // Check for tool calls in response
+        if let Some(tool_result) = extract_and_run_tool(&response, &conn, db_path) {
+            println!("\n{}", response);
+            println!("\n  [Tool executed: {}]", tool_result.tool_name);
+            println!("  {}", tool_result.summary);
+
+            // Feed results back to AI for analysis
+            let follow_up = format!(
+                "The tool returned these results:\n\n{}\n\n\
+                 Analyze these results and continue your analysis. \
+                 If you need more data, use another tool.",
+                tool_result.output
+            );
+            let mut prompt2 = format!("{}\n\n## Conversation\n", system_prompt);
+            let start2 = conversation.len().saturating_sub(5);
+            for (q, a) in &conversation[start2..] {
+                prompt2.push_str(&format!("User: {}\nAssistant: {}\n\n", q, a));
+            }
+            prompt2.push_str(&format!("User: {}\nAssistant: {}\n\n{}", question, response, follow_up));
+
+            print!("  ");
+            io::stdout().flush().ok();
+
+            match ollama.generate(&prompt2) {
+                Ok(follow_response) => {
+                    println!("\n{}", follow_response);
+                    conversation.push((question, format!("{}\n\n[Tool: {}]\n{}", response, tool_result.tool_name, follow_response)));
+                }
+                Err(e) => {
+                    eprintln!("\n[Error on follow-up]: {}", e);
+                    conversation.push((question, response));
+                }
+            }
+        } else {
+            println!("{}", response);
+            conversation.push((question, response));
         }
         println!();
     }
 
     println!("\n[System] Chat ended. {} exchanges recorded.", conversation.len());
+}
+
+// ── Tool System ──────────────────────────────────────────────
+
+struct ToolResult {
+    tool_name: String,
+    summary: String,
+    output: String,
+}
+
+fn extract_and_run_tool(response: &str, conn: &Connection, db_path: &Path) -> Option<ToolResult> {
+    // Look for JSON tool calls in the response
+    for line in response.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('{') && trimmed.contains("\"tool\"") {
+            if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
+                if let Some(tool) = val.get("tool").and_then(|t| t.as_str()) {
+                    return match tool {
+                        "nmap" => {
+                            let target = val.get("target").and_then(|t| t.as_str()).unwrap_or("192.168.1.0/24");
+                            Some(run_tool_nmap(target))
+                        }
+                        "tshark" => {
+                            let filter = val.get("filter").and_then(|t| t.as_str()).unwrap_or("");
+                            let duration = val.get("duration").and_then(|d| d.as_u64()).unwrap_or(10);
+                            Some(run_tool_tshark(filter, duration, db_path))
+                        }
+                        "sql" => {
+                            let query = val.get("query").and_then(|q| q.as_str()).unwrap_or("");
+                            Some(run_tool_sql(query, conn))
+                        }
+                        "search" => {
+                            let query = val.get("query").and_then(|q| q.as_str()).unwrap_or("");
+                            Some(run_tool_search(query, conn))
+                        }
+                        _ => None,
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn run_tool_nmap(target: &str) -> ToolResult {
+    println!("\n  [Tool] Running nmap on {}...", target);
+    let args = vec!["-sV", "-O", "--open", "-oX", "-", "-T4", target];
+    let output = Command::new("sudo").arg("nmap").args(&args)
+        .stdin(Stdio::inherit())
+        .output().expect("Failed to run nmap");
+    let xml = String::from_utf8_lossy(&output.stdout);
+
+    let conn = Connection::open(":memory:").unwrap();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+    let summary = parse_nmap_xml(&xml, &conn, now);
+
+    let device_count: u64 = conn.query_row("SELECT COUNT(*) FROM devices", [], |r| r.get(0)).unwrap_or(0);
+
+    ToolResult {
+        tool_name: "nmap".into(),
+        summary: format!("Found {} devices on {}", device_count, target),
+        output: summary,
+    }
+}
+
+fn run_tool_tshark(filter: &str, duration: u64, db_path: &Path) -> ToolResult {
+    println!("\n  [Tool] Capturing traffic for {}s (filter: {})...", duration, filter);
+    let mut args = vec!["-i", "en1", "-n", "-l", "-T", "ek", "-f", "not host 127.0.0.1"];
+    if !filter.is_empty() {
+        args = vec!["-i", "en1", "-n", "-l", "-T", "ek", "-f", filter];
+    }
+    args.extend(["-e", "frame.time_epoch", "-e", "ip.src", "-e", "ip.dst",
+                 "-e", "tcp.srcport", "-e", "tcp.dstport",
+                 "-e", "udp.srcport", "-e", "udp.dstport", "-e", "dns.qry.name"]);
+
+    let mut child = Command::new("sudo").args(["tshark"]).args(&args)
+        .stdout(Stdio::piped()).stderr(Stdio::null())
+        .spawn().expect("Failed to start tshark");
+
+    let child_pid = child.id();
+    let timer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(duration));
+        let _ = Command::new("sudo").args(["kill", "-INT"]).arg(child_pid.to_string()).output();
+    });
+
+    let mut packets = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        let reader = std::io::BufReader::new(stdout);
+        use std::io::BufRead;
+        for line in reader.lines().map_while(|r| r.ok()) {
+            if let Some((_, src, dst, _, _, _, _, dns)) = extract_fields(&line) {
+                let src = src.unwrap_or_default();
+                let dst = dst.unwrap_or_default();
+                let dns = dns.map(|d| format!(" [{}]", d)).unwrap_or_default();
+                packets.push(format!("→ {}{}", dst, dns));
+            }
+            if packets.len() >= 50 { break; }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = timer.join();
+
+    ToolResult {
+        tool_name: "tshark".into(),
+        summary: format!("Captured {} packets ({}s)", packets.len(), duration),
+        output: packets.join("\n"),
+    }
+}
+
+fn run_tool_sql(query: &str, conn: &Connection) -> ToolResult {
+    println!("\n  [Tool] Running SQL: {}", query);
+    match conn.prepare(query) {
+        Ok(mut stmt) => {
+            let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+            let mut rows = stmt.query([]).unwrap();
+            let mut output = vec![cols.join(" | ")];
+            let mut count = 0;
+            while let Some(row) = rows.next().unwrap() {
+                let vals: Vec<String> = (0..cols.len()).map(|i| {
+                    row.get::<_, String>(i).unwrap_or_else(|_| "NULL".into())
+                }).collect();
+                output.push(vals.join(" | "));
+                count += 1;
+                if count >= 20 { break; }
+            }
+            ToolResult {
+                tool_name: "sql".into(),
+                summary: format!("{} rows returned", count),
+                output: output.join("\n"),
+            }
+        }
+        Err(e) => ToolResult {
+            tool_name: "sql".into(),
+            summary: "SQL error".into(),
+            output: format!("Error: {}", e),
+        },
+    }
+}
+
+fn run_tool_search(query: &str, conn: &Connection) -> ToolResult {
+    println!("\n  [Tool] Searching: {}", query);
+    let mut output = Vec::new();
+    // Capture search output by executing the search
+    let parts: Vec<&str> = query.splitn(2, ' ').collect();
+    let cmd = parts[0].to_lowercase();
+    let arg = parts.get(1).unwrap_or(&"");
+
+    match cmd.as_str() {
+        "ip" => {
+            let pattern = format!("%{}%", arg);
+            let mut stmt = conn.prepare(
+                "SELECT epoch, ip_src, ip_dst, tcp_dst_port, dns_query FROM packets WHERE ip_src LIKE ?1 OR ip_dst LIKE ?1 ORDER BY epoch DESC LIMIT 20"
+            ).unwrap();
+            let rows = stmt.query_map(params![pattern], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            }).unwrap();
+            for row in rows {
+                let (epoch, src, dst, port, dns): (Option<f64>, Option<String>, Option<String>, Option<i32>, Option<String>) = row.unwrap();
+                output.push(format!("{} → {} port:{} dns:{}", src.unwrap_or_default(), dst.unwrap_or_default(), port.unwrap_or(0), dns.unwrap_or_default()));
+            }
+        }
+        "devices" => {
+            let mut stmt = conn.prepare("SELECT ip, os_guess, ports FROM devices").unwrap();
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+            for row in rows {
+                let (ip, os, ports): (String, Option<String>, String) = row.unwrap();
+                output.push(format!("{} [{}] {}", ip, os.unwrap_or_default(), ports));
+            }
+        }
+        "connections" => {
+            let pattern = format!("%{}%", arg);
+            let mut stmt = conn.prepare(
+                "SELECT ip_dst, COUNT(*) as cnt FROM packets WHERE ip_src LIKE ?1 GROUP BY ip_dst ORDER BY cnt DESC LIMIT 10"
+            ).unwrap();
+            let rows = stmt.query_map(params![pattern], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+            for row in rows {
+                let (ip, count): (String, u64) = row.unwrap();
+                output.push(format!("→ {} (×{})", ip, count));
+            }
+        }
+        _ => {
+            output.push(format!("Unknown search command: {}", cmd));
+        }
+    }
+
+    ToolResult {
+        tool_name: "search".into(),
+        summary: format!("Search '{}' returned {} results", query, output.len()),
+        output: output.join("\n"),
+    }
 }
 
 // ── Context Builders ─────────────────────────────────────────
