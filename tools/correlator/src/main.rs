@@ -1399,7 +1399,9 @@ fn main() {
                     // Thorough: version + OS + scripts
                     vec!["-sV", "-O", "-sC", "--open", "-oX", "-", "-T4", target.as_str()]
                 };
-                let output = Command::new("sudo").arg("nmap").args(&args).output().expect("Failed to run nmap");
+                let output = Command::new("sudo").arg("nmap").args(&args)
+                    .stdin(std::process::Stdio::inherit())
+                    .output().expect("Failed to run nmap");
                 let xml_str = String::from_utf8_lossy(&output.stdout);
 
                 if !xml_str.is_empty() {
