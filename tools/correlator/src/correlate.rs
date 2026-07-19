@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -19,6 +21,7 @@ pub struct Packet {
     pub udp_src_port: Option<u32>,
     pub udp_dst_port: Option<u32>,
     pub dns_query: Option<String>,
+    pub frame_len: Option<u32>,
 }
 
 /// TCP connection lifecycle tracking
@@ -298,14 +301,24 @@ impl IpProfile {
             }
         }
 
-        // Inter-arrival time
-        if !self.inter_arrival_times.is_empty() {
-            let last = self.inter_arrival_times.last().copied().unwrap_or(0.0);
-            if last > 0.0 {
-                self.inter_arrival_times.push(pkt.epoch - last);
+        self.inter_arrival_times.push(pkt.epoch);
+
+        // Packet size tracking
+        if let Some(len) = pkt.frame_len {
+            let n = self.packet_count as f64;
+            let old_avg = self.avg_packet_size;
+            self.avg_packet_size = old_avg + (len as f64 - old_avg) / n;
+            if n > 1.0 {
+                let old_var = self.packet_size_variance;
+                self.packet_size_variance = ((n - 2.0) * old_var + (len as f64 - old_avg) * (len as f64 - self.avg_packet_size)) / (n - 1.0);
+            }
+            if is_src {
+                self.outbound_bytes += len as u64;
+            }
+            if is_dst {
+                self.inbound_bytes += len as u64;
             }
         }
-        self.inter_arrival_times.push(pkt.epoch);
 
         // Temporal bins (1-second resolution)
         let bin_start = pkt.epoch.floor();
@@ -757,7 +770,7 @@ fn detect_scanner(profile: &IpProfile) -> Option<Finding> {
         indicators.push(format!("port scanning: {} unique ports", profile.dest_ports.len()));
     }
 
-    let avg_pkts_per_dest = if profile.dest_ips.len() > 0 {
+    let avg_pkts_per_dest = if !profile.dest_ips.is_empty() {
         profile.outbound_count as f64 / profile.dest_ips.len() as f64
     } else {
         0.0
@@ -1164,7 +1177,7 @@ fn detect_c2_beacon(profile: &IpProfile) -> Option<Finding> {
     let cv = variance.sqrt() / mean;
 
     let is_regular = cv < 0.15 && mean > 5.0;
-    let is_jittered = cv >= 0.05 && cv < 0.3 && mean > 10.0;
+    let is_jittered = (0.05..0.3).contains(&cv) && mean > 10.0;
 
     if !is_regular && !is_jittered { return None; }
 
@@ -1187,7 +1200,7 @@ fn detect_c2_beacon(profile: &IpProfile) -> Option<Finding> {
         indicators.push(format!("{} DNS queries, {} outbound (minimal DNS)", profile.dns_count, profile.outbound_count));
     }
 
-    let avg_out = if profile.dest_ips.len() > 0 { profile.outbound_count as f64 / profile.dest_ips.len() as f64 } else { 0.0 };
+    let avg_out = if !profile.dest_ips.is_empty() { profile.outbound_count as f64 / profile.dest_ips.len() as f64 } else { 0.0 };
     if avg_out < 8.0 && avg_out > 0.0 {
         score += 0.1;
         indicators.push(format!("small payloads: {:.1} pkts/dest", avg_out));
@@ -1229,7 +1242,7 @@ fn detect_network_recon(profile: &IpProfile) -> Option<Finding> {
         indicators.push(format!("targeting {} internal hosts", internal_dests.len()));
     }
 
-    let avg_pkts_per_dest = if internal_dests.len() > 0 {
+    let avg_pkts_per_dest = if !internal_dests.is_empty() {
         profile.outbound_count as f64 / internal_dests.len() as f64
     } else { 0.0 };
 
@@ -1368,7 +1381,7 @@ impl Correlator {
         let mut findings = Vec::new();
         let all_profiles = self.profiles.clone();
 
-        for (_ip, profile) in &self.profiles {
+        for profile in self.profiles.values() {
             if profile.packet_count < 8 { continue; }
 
             let mut ip_findings = Vec::new();
@@ -1625,7 +1638,7 @@ impl OllamaClient {
         false
     }
 
-    pub fn generate(&self, prompt: &str) -> Result<String, String> {
+    pub fn chat(&self, messages: &[Value], tools: &[Value]) -> Result<Value, String> {
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(300))
             .build()
@@ -1633,21 +1646,24 @@ impl OllamaClient {
 
         let body = json!({
             "model": self.model,
-            "prompt": prompt,
+            "messages": messages,
+            "tools": tools,
             "stream": true,
             "options": {
                 "temperature": 0.3,
-                "num_predict": 2048,
+                "num_predict": 4096,
+                "num_ctx": 8192,
             }
         });
 
-        let resp = client.post(format!("{}/api/generate", self.base_url))
+        let resp = client.post(format!("{}/api/chat", self.base_url))
             .json(&body)
             .send()
             .map_err(|e| e.to_string())?;
 
         use std::io::{BufRead, Write};
-        let mut full_response = String::new();
+        let mut content = String::new();
+        let mut tool_calls: Vec<Value> = Vec::new();
         let mut reader = std::io::BufReader::new(resp);
         let mut buf = String::new();
         loop {
@@ -1656,10 +1672,19 @@ impl OllamaClient {
                 Ok(0) => break,
                 Ok(_) => {
                     if let Ok(chunk) = serde_json::from_str::<Value>(&buf) {
-                        if let Some(token) = chunk["response"].as_str() {
-                            print!("{}", token);
-                            std::io::stdout().flush().ok();
-                            full_response.push_str(token);
+                        if let Some(msg) = chunk.get("message") {
+                            if let Some(c) = msg.get("content").and_then(|v| v.as_str()) {
+                                if !c.is_empty() {
+                                    print!("{}", c);
+                                    std::io::stdout().flush().ok();
+                                    content.push_str(c);
+                                }
+                            }
+                            if let Some(tc) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+                                for call in tc {
+                                    tool_calls.push(call.clone());
+                                }
+                            }
                         }
                         if chunk["done"].as_bool().unwrap_or(false) {
                             break;
@@ -1670,10 +1695,22 @@ impl OllamaClient {
             }
         }
         println!();
-        if full_response.is_empty() {
+
+        Ok(json!({
+            "content": content,
+            "tool_calls": tool_calls,
+        }))
+    }
+
+    /// Simple text generation (for analysis modes that don't need tools)
+    pub fn generate(&self, prompt: &str) -> Result<String, String> {
+        let messages = vec![json!({"role": "user", "content": prompt})];
+        let result = self.chat(&messages, &[])?;
+        let content = result["content"].as_str().unwrap_or("").to_string();
+        if content.is_empty() {
             Err("Empty response from Ollama".into())
         } else {
-            Ok(full_response)
+            Ok(content)
         }
     }
 
@@ -1872,8 +1909,18 @@ impl OllamaClient {
 // ══════════════════════════════════════════════════════════════
 
 pub fn load_from_db(conn: &Connection) -> Vec<Packet> {
+    let has_frame_len: bool = conn
+        .prepare("SELECT frame_len FROM packets LIMIT 0")
+        .is_ok();
+
+    let sql = if has_frame_len {
+        "SELECT epoch, ip_src, ip_dst, tcp_src_port, tcp_dst_port, udp_src_port, udp_dst_port, dns_query, frame_len FROM packets ORDER BY epoch"
+    } else {
+        "SELECT epoch, ip_src, ip_dst, tcp_src_port, tcp_dst_port, udp_src_port, udp_dst_port, dns_query, NULL FROM packets ORDER BY epoch"
+    };
+
     let mut stmt = conn
-        .prepare("SELECT epoch, ip_src, ip_dst, tcp_src_port, tcp_dst_port, udp_src_port, udp_dst_port, dns_query FROM packets ORDER BY epoch")
+        .prepare(sql)
         .expect("Failed to prepare query");
 
     stmt.query_map([], |row| {
@@ -1886,6 +1933,7 @@ pub fn load_from_db(conn: &Connection) -> Vec<Packet> {
             udp_src_port: row.get(5)?,
             udp_dst_port: row.get(6)?,
             dns_query: row.get(7)?,
+            frame_len: row.get(8)?,
         })
     }).expect("Failed to query packets")
     .filter_map(|r| r.ok())

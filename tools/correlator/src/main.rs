@@ -1,17 +1,25 @@
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 use rusqlite::{Connection, params};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 mod correlate;
+mod scanner;
 use correlate::{Correlator, OllamaClient, load_from_db};
+use scanner::{BeliefSystem, ScannerEvent, start_scanner};
+
+static ALWAYS_ALLOW: AtomicBool = AtomicBool::new(false);
+static BELIEFS: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<BeliefSystem>>> = std::sync::OnceLock::new();
 
 // ── Config ───────────────────────────────────────────────────
 
@@ -243,12 +251,18 @@ fn init_db(db_path: &Path) -> Connection {
             epoch REAL, ip_src TEXT, ip_dst TEXT,
             tcp_src_port INTEGER, tcp_dst_port INTEGER,
             udp_src_port INTEGER, udp_dst_port INTEGER,
-            dns_query TEXT, raw_json TEXT
+            dns_query TEXT, raw_json TEXT,
+            frame_len INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_epoch ON packets(epoch);
         CREATE INDEX IF NOT EXISTS idx_src ON packets(ip_src);
         CREATE INDEX IF NOT EXISTS idx_dst ON packets(ip_dst);
-        CREATE INDEX IF NOT EXISTS idx_dns ON packets(dns_query);
+        CREATE INDEX IF NOT EXISTS idx_dns ON packets(dns_query);"
+    ).expect("Failed to create tables");
+    // Migration: add frame_len to pre-existing databases
+    conn.execute("ALTER TABLE packets ADD COLUMN frame_len INTEGER", []).ok();
+    conn.execute_batch(
+        "
 
         CREATE TABLE IF NOT EXISTS devices (
             ip TEXT PRIMARY KEY,
@@ -308,7 +322,7 @@ fn chrono_suffix() -> String {
 
 // ── TShark Field Extractor ───────────────────────────────────
 
-fn extract_fields(raw_line: &str) -> Option<(Option<f64>, Option<String>, Option<String>, Option<u32>, Option<u32>, Option<u32>, Option<u32>, Option<String>)> {
+fn extract_fields(raw_line: &str) -> Option<(Option<f64>, Option<String>, Option<String>, Option<u32>, Option<u32>, Option<u32>, Option<u32>, Option<String>, Option<u32>)> {
     let val: Value = serde_json::from_str(raw_line).ok()?;
     let layers = val.get("_source")
         .and_then(|s| s.get("layers"))
@@ -357,6 +371,7 @@ fn extract_fields(raw_line: &str) -> Option<(Option<f64>, Option<String>, Option
         get_field("udp.srcport").and_then(|s| s.parse::<u32>().ok()),
         get_field("udp.dstport").and_then(|s| s.parse::<u32>().ok()),
         get_field("dns.qry.name").map(|s| s.to_string()),
+        get_field("frame.len").and_then(|s| s.parse::<u32>().ok()),
     ))
 }
 
@@ -415,8 +430,8 @@ impl InterpretEngine {
     }
 
     fn process_packet(&mut self, epoch: f64, ip_src: &str, ip_dst: &str,
-                      tcp_src: Option<u16>, tcp_dst: Option<u16>,
-                      udp_src: Option<u16>, udp_dst: Option<u16>,
+                      _tcp_src: Option<u16>, tcp_dst: Option<u16>,
+                      _udp_src: Option<u16>, _udp_dst: Option<u16>,
                       dns_qry: Option<&str>) {
         // Skip broadcast/multicast
         if ip_dst.starts_with("224.") || ip_dst.starts_with("239.") || ip_dst == "255.255.255.255" {
@@ -548,70 +563,59 @@ fn run_live_interpret(interface: &str, duration: u64, no_save: bool, output: Opt
     println!("═══════ LIVE INTERPRET ═══════");
     println!("[System] Interface: {}", interface);
     println!("[System] Duration: {}s", duration);
+    println!("[System] AI: {}", if use_ai { "enabled" } else { "disabled (use --ai to enable)" });
     println!("[System] Press 'q' to stop early\n");
 
+    let db_path = default_db_path(no_save, output);
+    let conn = init_db(&db_path);
+    let conn = Arc::new(Mutex::new(conn));
+
+    // Start tshark in background thread
     let tshark_args = vec![
         "-i", interface, "-n", "-l", "-T", "ek",
         "-f", "not host 127.0.0.1",
-        "-e", "frame.time_epoch", "-e", "ip.src", "-e", "ip.dst",
+        "-e", "frame.time_epoch", "-e", "frame.len",
+        "-e", "ip.src", "-e", "ip.dst",
         "-e", "tcp.srcport", "-e", "tcp.dstport",
         "-e", "udp.srcport", "-e", "udp.dstport", "-e", "dns.qry.name",
     ];
 
-    let mut child = Command::new("sudo").args(["tshark"]).args(&tshark_args)
+    let mut child = sudo_cmd("tshark").args(&tshark_args)
+        .stdin(Stdio::inherit())
         .stdout(Stdio::piped()).stderr(Stdio::null())
         .spawn().expect("Failed to start tshark — is it installed?");
 
     let child_pid = child.id();
-    let timer_handle = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(duration));
-        let _ = Command::new("sudo").args(["kill", "-INT"]).arg(child_pid.to_string()).output();
-    });
 
-    let db_path = default_db_path(no_save, output);
-    let conn = init_db(&db_path);
-    let mut insert_stmt = conn.prepare(
-        "INSERT INTO packets (epoch, ip_src, ip_dst, tcp_src_port, tcp_dst_port, udp_src_port, udp_dst_port, dns_query, raw_json) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)"
-    ).unwrap();
+    // In AI mode, don't use a timer — run until user quits
+    let timer_handle = if !use_ai {
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(duration));
+            let _ = sudo_cmd("kill").args(["-INT", &child_pid.to_string()]).output();
+        });
+        Some(handle)
+    } else {
+        None
+    };
 
-    let mut engine = InterpretEngine::new();
-    let mut packet_count: u64 = 0;
-    let mut stored_count: u64 = 0;
-    let start = Instant::now();
+    // If AI mode, spawn tshark reader in background and run chat loop
+    if use_ai {
+        // Take stdout before spawning thread
+        let stdout = child.stdout.take().expect("Failed to take tshark stdout");
 
-    use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-    use std::io::BufRead;
+        // Spawn packet reader thread
+        let conn_clone = conn.clone();
+        let reader_handle = std::thread::spawn(move || {
+            use std::io::BufRead;
+            let mut engine = InterpretEngine::new();
 
-    crossterm::terminal::enable_raw_mode().ok();
-    let mut early_exit = false;
-
-    if let Some(stdout_stream) = child.stdout.take() {
-        let reader = std::io::BufReader::new(stdout_stream);
-
-        for line_result in reader.lines() {
-            if event::poll(Duration::from_millis(0)).unwrap() {
-                if let Event::Key(key_event) = event::read().unwrap() {
-                    if key_event.kind == KeyEventKind::Press {
-                        match key_event.code {
-                            KeyCode::Char('q') | KeyCode::Char('Q') => {
-                                println!("\r\x1b[K[System] Stopping early...");
-                                early_exit = true;
-                                break;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-
-            match line_result {
-                Ok(raw_line) => {
+            let reader = std::io::BufReader::new(stdout);
+            for line_result in reader.lines() {
+                if let Ok(raw_line) = line_result {
                     if raw_line.trim().is_empty() { continue; }
                     if raw_line.contains("\"index\"") && !raw_line.contains("\"_source\"") { continue; }
 
-                    if let Some((epoch, ip_src, ip_dst, tcp_src, tcp_dst, udp_src, udp_dst, dns_qry)) = extract_fields(&raw_line) {
-                        packet_count += 1;
-
+                    if let Some((epoch, ip_src, ip_dst, tcp_src, tcp_dst, udp_src, udp_dst, dns_qry, frame_len)) = extract_fields(&raw_line) {
                         if let (Some(ref src), Some(ref dst)) = (&ip_src, &ip_dst) {
                             engine.process_packet(
                                 epoch.unwrap_or(0.0), src, dst,
@@ -619,66 +623,125 @@ fn run_live_interpret(interface: &str, duration: u64, no_save: bool, output: Opt
                                 udp_src.map(|p| p as u16), udp_dst.map(|p| p as u16),
                                 dns_qry.as_deref(),
                             );
-
-                            // Store packet
-                            let _ = insert_stmt.execute(params![
-                                epoch, ip_src.as_deref(), ip_dst.as_deref(),
-                                tcp_src.map(|p| p as i32), tcp_dst.map(|p| p as i32),
-                                udp_src.map(|p| p as i32), udp_dst.map(|p| p as i32),
-                                dns_qry.as_deref(), raw_line.trim()
-                            ]);
-                            stored_count += 1;
-                        }
-
-                        // Print live interpretation
-                        if verbose || packet_count % 10 == 0 {
-                            let elapsed = start.elapsed().as_secs_f64();
-                            if let Some(ref dns) = dns_qry {
-                                println!("\r\x1b[K  {:.1}s | {} → {} | DNS: {}", elapsed,
-                                    ip_src.as_deref().unwrap_or("?"),
-                                    ip_dst.as_deref().unwrap_or("?"),
-                                    dns);
-                            } else if let Some(port) = tcp_dst {
-                                let svc = engine.port_map.get(&(port as u16)).unwrap_or(&"?");
-                                println!("\r\x1b[K  {:.1}s | {} → {}:{} ({})", elapsed,
-                                    ip_src.as_deref().unwrap_or("?"),
-                                    ip_dst.as_deref().unwrap_or("?"),
-                                    port, svc);
-                            }
-                        }
-
-                        if packet_count % 100 == 0 {
-                            let elapsed = start.elapsed().as_secs();
-                            print!("\r\x1b[K  {} pkts | {} stored | {}s elapsed  ",
-                                packet_count, stored_count, elapsed);
-                            io::stdout().flush().ok();
+                            let c = conn_clone.lock().unwrap();
+                            let _ = c.execute(
+                                "INSERT INTO packets (epoch, ip_src, ip_dst, tcp_src_port, tcp_dst_port, udp_src_port, udp_dst_port, dns_query, raw_json, frame_len) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                                params![epoch, ip_src.as_deref(), ip_dst.as_deref(), tcp_src.map(|p| p as i32), tcp_dst.map(|p| p as i32), udp_src.map(|p| p as i32), udp_dst.map(|p| p as i32), dns_qry.as_deref(), raw_line.trim(), frame_len.map(|p| p as i32)]
+                            );
                         }
                     }
                 }
-                Err(_) => break,
+            }
+        });
+
+        // Run chat loop
+        run_chat(&db_path, model, true);
+
+        // Cleanup
+        let _ = child.kill();
+        let _ = reader_handle.join();
+        // timer_handle is None in AI mode
+    } else {
+        // Original non-AI mode
+        let mut engine = InterpretEngine::new();
+        let mut packet_count: u64 = 0;
+        let mut stored_count: u64 = 0;
+        let start = Instant::now();
+
+        use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+        use std::io::BufRead;
+
+        crossterm::terminal::enable_raw_mode().ok();
+
+        if let Some(stdout_stream) = child.stdout.take() {
+            let reader = std::io::BufReader::new(stdout_stream);
+
+            for line_result in reader.lines() {
+                if event::poll(Duration::from_millis(0)).unwrap() {
+                    if let Event::Key(key_event) = event::read().unwrap() {
+                        if key_event.kind == KeyEventKind::Press {
+                            match key_event.code {
+                                KeyCode::Char('q') | KeyCode::Char('Q') => {
+                                    println!("\r\x1b[K[System] Stopping early...");
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+
+                match line_result {
+                    Ok(raw_line) => {
+                        if raw_line.trim().is_empty() { continue; }
+                        if raw_line.contains("\"index\"") && !raw_line.contains("\"_source\"") { continue; }
+
+                        if let Some((epoch, ip_src, ip_dst, tcp_src, tcp_dst, udp_src, udp_dst, dns_qry, frame_len)) = extract_fields(&raw_line) {
+                            packet_count += 1;
+
+                            if let (Some(ref src), Some(ref dst)) = (&ip_src, &ip_dst) {
+                                engine.process_packet(
+                                    epoch.unwrap_or(0.0), src, dst,
+                                    tcp_src.map(|p| p as u16), tcp_dst.map(|p| p as u16),
+                                    udp_src.map(|p| p as u16), udp_dst.map(|p| p as u16),
+                                    dns_qry.as_deref(),
+                                );
+
+                                let c = conn.lock().unwrap();
+                                let _ = c.execute(
+                                    "INSERT INTO packets (epoch, ip_src, ip_dst, tcp_src_port, tcp_dst_port, udp_src_port, udp_dst_port, dns_query, raw_json, frame_len) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                                    params![epoch, ip_src.as_deref(), ip_dst.as_deref(), tcp_src.map(|p| p as i32), tcp_dst.map(|p| p as i32), udp_src.map(|p| p as i32), udp_dst.map(|p| p as i32), dns_qry.as_deref(), raw_line.trim(), frame_len.map(|p| p as i32)]
+                                );
+                                stored_count += 1;
+                            }
+
+                            if verbose || packet_count.is_multiple_of(10) {
+                                let elapsed = start.elapsed().as_secs_f64();
+                                if let Some(ref dns) = dns_qry {
+                                    println!("\r\x1b[K  {:.1}s | {} → {} | DNS: {}", elapsed,
+                                        ip_src.as_deref().unwrap_or("?"),
+                                        ip_dst.as_deref().unwrap_or("?"),
+                                        dns);
+                                } else if let Some(port) = tcp_dst {
+                                    let svc = engine.port_map.get(&(port as u16)).unwrap_or(&"?");
+                                    println!("\r\x1b[K  {:.1}s | {} → {}:{} ({})", elapsed,
+                                        ip_src.as_deref().unwrap_or("?"),
+                                        ip_dst.as_deref().unwrap_or("?"),
+                                        port, svc);
+                                }
+                            }
+
+                            if packet_count.is_multiple_of(100) {
+                                let elapsed = start.elapsed().as_secs();
+                                print!("\r\x1b[K  {} pkts | {} stored | {}s elapsed  ",
+                                    packet_count, stored_count, elapsed);
+                                io::stdout().flush().ok();
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+
+        crossterm::terminal::disable_raw_mode().ok();
+        let _ = child.kill();
+        let _ = child.wait();
+        if let Some(h) = timer_handle { let _ = h.join(); }
+
+        println!("\n\n═══ CAPTURE COMPLETE ═══");
+        println!("[System] {} packets captured, {} stored", packet_count, stored_count);
+
+        let interpretations = engine.interpret();
+        if !interpretations.is_empty() {
+            println!("\n═══ INTERPRETATION ═══");
+            for (_, desc) in &interpretations {
+                println!("  {}", desc);
             }
         }
     }
 
-    crossterm::terminal::disable_raw_mode().ok();
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = timer_handle.join();
-
-    println!("\n\n═══ CAPTURE COMPLETE ═══");
-    println!("[System] {} packets captured, {} stored", packet_count, stored_count);
-
-    // Print interpretation summary
-    let interpretations = engine.interpret();
-    if !interpretations.is_empty() {
-        println!("\n═══ INTERPRETATION ═══");
-        for (_, desc) in &interpretations {
-            println!("  {}", desc);
-        }
-    }
-
     println!("\n[System] Database saved at {}", db_path.display());
-    println!("[System] To chat with AI: correlator chat -d {}", db_path.display());
 }
 
 // ── Capture Mode (Parallel TShark + nmap) ────────────────────
@@ -698,11 +761,13 @@ fn run_capture(interface: &str, target: &str, duration: u64, no_save: bool, outp
         let tshark_args = vec![
             "-i", interface, "-n", "-l", "-T", "ek",
             "-f", "not host 127.0.0.1",
-            "-e", "frame.time_epoch", "-e", "ip.src", "-e", "ip.dst",
+            "-e", "frame.time_epoch", "-e", "frame.len",
+            "-e", "ip.src", "-e", "ip.dst",
             "-e", "tcp.srcport", "-e", "tcp.dstport",
             "-e", "udp.srcport", "-e", "udp.dstport", "-e", "dns.qry.name",
         ];
-        let child = Command::new("sudo").args(["tshark"]).args(&tshark_args)
+        let child = sudo_cmd("tshark").args(&tshark_args)
+            .stdin(Stdio::inherit())
             .stdout(Stdio::piped()).stderr(Stdio::null())
             .spawn().expect("Failed to start tshark");
         Some(child)
@@ -719,7 +784,7 @@ fn run_capture(interface: &str, target: &str, duration: u64, no_save: bool, outp
             vec!["-sV", "-O", "-sC", "--open", "-oX", "-", "-T4", target]
         };
 
-        let output = Command::new("sudo").arg("nmap").args(&args)
+        let output = sudo_cmd("nmap").args(&args)
             .stdin(Stdio::inherit())
             .output().expect("Failed to run nmap");
 
@@ -742,7 +807,7 @@ fn run_capture(interface: &str, target: &str, duration: u64, no_save: bool, outp
         let child_pid = child.id();
         let timer_handle = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_secs(duration));
-            let _ = Command::new("sudo").args(["kill", "-INT"]).arg(child_pid.to_string()).output();
+            let _ = sudo_cmd("kill").args(["-INT", &child_pid.to_string()]).output();
         });
 
         if let Some(stdout_stream) = child.stdout.take() {
@@ -759,16 +824,20 @@ fn run_capture(interface: &str, target: &str, duration: u64, no_save: bool, outp
                         if raw_line.trim().is_empty() { continue; }
                         if raw_line.contains("\"index\"") && !raw_line.contains("\"_source\"") { continue; }
 
-                        if let Some((epoch, ip_src, ip_dst, tcp_src, tcp_dst, udp_src, udp_dst, dns_qry)) = extract_fields(&raw_line) {
+                        if debug {
+                            eprintln!("[debug] {}", raw_line.trim());
+                        }
+
+                        if let Some((epoch, ip_src, ip_dst, tcp_src, tcp_dst, udp_src, udp_dst, dns_qry, frame_len)) = extract_fields(&raw_line) {
                             packet_count += 1;
                             let c = conn.lock().unwrap();
                             let _ = c.execute(
-                                "INSERT INTO packets (epoch, ip_src, ip_dst, tcp_src_port, tcp_dst_port, udp_src_port, udp_dst_port, dns_query, raw_json) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-                                params![epoch, ip_src, ip_dst, tcp_src.map(|p| p as i32), tcp_dst.map(|p| p as i32), udp_src.map(|p| p as i32), udp_dst.map(|p| p as i32), dns_qry, raw_line.trim()]
+                                "INSERT INTO packets (epoch, ip_src, ip_dst, tcp_src_port, tcp_dst_port, udp_src_port, udp_dst_port, dns_query, raw_json, frame_len) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                                params![epoch, ip_src, ip_dst, tcp_src.map(|p| p as i32), tcp_dst.map(|p| p as i32), udp_src.map(|p| p as i32), udp_dst.map(|p| p as i32), dns_qry, raw_line.trim(), frame_len.map(|p| p as i32)]
                             );
                             stored_count += 1;
 
-                            if packet_count % 100 == 0 {
+                            if packet_count.is_multiple_of(100) {
                                 let elapsed = start.elapsed().as_secs();
                                 print!("\r\x1b[K  {} captured, {} stored, {}s elapsed  ", packet_count, stored_count, elapsed);
                                 io::stdout().flush().ok();
@@ -781,7 +850,7 @@ fn run_capture(interface: &str, target: &str, duration: u64, no_save: bool, outp
 
             let _ = child.kill();
             let _ = child.wait();
-            let _ = timer_handle.join();
+        let _ = timer_handle.join();
 
             println!("\n\n═══ CAPTURE COMPLETE ═══");
             println!("[System] {} packets captured, {} stored", packet_count, stored_count);
@@ -796,10 +865,10 @@ fn run_capture(interface: &str, target: &str, duration: u64, no_save: bool, outp
 
 // ── Chat Mode ────────────────────────────────────────────────
 
-fn run_chat(db_path: &Path, model: &str) {
+fn run_chat(db_path: &Path, model: &str, live_mode: bool) {
     println!("\n═══════ NETWORK INTELLIGENCE ═══════");
 
-    // Check Ollama first — don't waste time building context if unavailable
+    // Check Ollama first
     let ollama = OllamaClient::new(model);
     if !ollama.is_available() {
         println!("[System] Ollama not available. Entering search mode.");
@@ -812,53 +881,238 @@ fn run_chat(db_path: &Path, model: &str) {
     let ctx = build_network_context(db_path);
     let context_str = format_context_for_ai(&ctx);
 
-    let system_prompt = format!(
-        "You are a network analysis system with full access to this network. You are NOT a chatbot.\n\
-         You have: a database of captured packets, nmap scan results, device inventory, and tools to run further analysis.\n\n\
-         {}\n\n\
-         ## YOUR CAPABILITIES\n\
-         You can execute commands and get real results:\n\
-         - nmap: Scan any IP for open ports, OS detection, services\n\
-         - tshark: Capture live traffic with filters\n\
-         - sql: Query the packet database directly\n\
-         - search: Look up IPs, ports, DNS, connections\n\n\
-         ## INTERNET TOOLS (only when user asks for research)\n\
-         - webfetch: Fetch a URL to research vulnerabilities, CVEs, device docs\n\
-         - websearch: Search the internet for device info, vulnerabilities, exploits\n\
-         USE THESE ONLY when the user explicitly asks you to research something.\n\n\
-         ## TOOLS — Output EXACTLY one JSON block when you need data:\n\
-         {{\"tool\": \"nmap\", \"target\": \"192.168.1.60\"}}\n\
-         {{\"tool\": \"tshark\", \"filter\": \"host 192.168.1.60\", \"duration\": 10}}\n\
-         {{\"tool\": \"sql\", \"query\": \"SELECT * FROM packets WHERE ip_src='192.168.1.60' LIMIT 10\"}}\n\
-         {{\"tool\": \"search\", \"query\": \"connections 192.168.1.60\"}}\n\
-         {{\"tool\": \"webfetch\", \"url\": \"https://nvd.nist.gov/vuln/detail/CVE-2024-1234\"}}\n\
-         {{\"tool\": \"websearch\", \"query\": \"Sonos port 1443 vulnerability\"}}\n\n\
-         ## PERSONALITY\n\
-         - Be curious. When you find something interesting, dig deeper.\n\
-         - Investigate anomalies. Follow leads. Don't just list — explore.\n\
-         - If you don't know what a device is, say so AND try to find out.\n\
-         - Be direct. No apologies, no disclaimers, no filler.\n\
-         - You are an analyst with tools, not a language model.\n\n\
-         ## OUTPUT FORMAT\n\
-         - Device inventory (IP | MAC | Vendor | Type | Ports | Role)\n\
-         - Conversation flows (src → dst | volume | protocol)\n\
-         - Anomalies with severity and exploit potential\n\
-         - Topology summary\n\
-         - Recommended actions with specific commands",
-        context_str
-    );
+    // Initialize belief system from detector findings
+    let beliefs = Arc::new(Mutex::new(BeliefSystem::new()));
+    {
+        let mut sys = beliefs.lock().unwrap();
+        sys.initialize_from_findings(&ctx.findings);
+        // Ensure all discovered IPs have a belief entry
+        for ip in ctx.profiles.keys() {
+            sys.ensure_ip(ip);
+        }
+    }
+    let _ = BELIEFS.set(beliefs.clone());
+
+    // Start background scanner thread
+    let config = load_config();
+    let scanner_beliefs = beliefs.clone();
+    let (scanner_tx, scanner_rx) = std::sync::mpsc::channel::<ScannerEvent>();
+    let _scanner_thread = start_scanner(scanner_beliefs, scanner_tx, config.interface.clone());
+
+    // Add belief info to context
+    let belief_context = {
+        let sys = beliefs.lock().unwrap();
+        let top = ctx.findings.iter().take(5).map(|f| f.ip.as_str()).collect::<Vec<_>>();
+        format!("\n\n## Belief System\n\
+            Each IP tracked with 5-category distribution: BOT, IOT, CAMERA, CLEAN, UNKNOWN.\n\
+            Confidence is % probability. Entropy bits = uncertainty level (higher = less certain).\n\
+            IPs with <90% confidence in any category are auto-scanned in background.\n\
+            Top flagged IPs: {}. {} total IPs tracked.\n\
+            Use get_beliefs tool to query current state.",
+            top.join(", "), sys.len())
+    };
+
+    let system_prompt = if live_mode {
+        "LIVE CAPTURE. Packets are arriving now. Query the DB for current data.\n\n\
+         USE YOUR TOOLS. Do NOT tell the user to do things manually.\n\
+         You have: sql, search, scan_ip, get_beliefs, nmap, tshark, websearch, webfetch.\n\n\
+         When the user asks something, USE A TOOL. Don't explain how to do it.\n\
+         Example: 'Find the OS' → use scan_ip tool immediately.\n\
+         Example: 'What ports are these?' → use websearch tool immediately.\n\n\
+         RULES:\n\
+         - NEVER tell the user to run commands themselves\n\
+         - NEVER explain how to use tools — just use them\n\
+         - NEVER hallucinate example output — run the real tool\n\
+         - Be brief. 1-2 sentences max."
+    } else {
+        "You are a network analyst with a packet database.\n\n\
+         USE YOUR TOOLS. Do NOT tell the user to do things manually.\n\
+         You have: sql, search, scan_ip, get_beliefs, nmap, tshark, websearch, webfetch.\n\n\
+         When the user asks something, USE A TOOL. Don't explain how to do it.\n\n\
+         RULES:\n\
+         - NEVER tell the user to run commands themselves\n\
+         - NEVER explain how to use tools — just use them\n\
+         - NEVER hallucinate example output — run the real tool\n\
+         - Be brief. 1-2 sentences max."
+    };
 
     println!("\n[System] Chat ready. {} devices, {} packets, {} findings loaded.",
         ctx.devices.len(), ctx.packet_count, ctx.findings.len());
-    println!("[System] Tools: nmap, tshark, sql, search, webfetch, websearch");
-    println!("[System] Ask: 'scan 192.168.1.60', 'who does X talk to', 'research this vulnerability'");
-    println!("[System] Internet tools activate only when you ask for further research.\n");
+    println!("[System] Tools: nmap, tshark, sql, search, webfetch, websearch, scan_ip, get_beliefs");
+    println!("[System] Belief tracker: scanning {} IPs in background (use /beliefs to see)\n",
+        {
+            let sys = beliefs.lock().unwrap();
+            sys.len()
+        });
 
     let conn = open_db(db_path);
-    let mut conversation: Vec<(String, String)> = Vec::new();
+    let mut messages: Vec<Value> = Vec::new();
     let mut input = String::new();
 
+    // System message
+    messages.push(json!({
+        "role": "system",
+        "content": system_prompt
+    }));
+
+    // First message: inject context
+    messages.push(json!({
+        "role": "user",
+        "content": format!("Loaded {} devices, {} packets, {} findings.\n\n{}{}",
+            ctx.devices.len(), ctx.packet_count, ctx.findings.len(), context_str, belief_context)
+    }));
+    messages.push(json!({
+        "role": "assistant",
+        "content": "Got it. I can see your network and I'm tracking beliefs. What do you want to know?"
+    }));
+
+    // Tool definitions for Ollama
+    let tools = vec![
+        json!({
+            "type": "function",
+            "function": {
+                "name": "nmap",
+                "description": "Ping-sweep a single IP to check if it is online. Does NOT detect ports or services.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "target": { "type": "string", "description": "IP address to ping" }
+                    },
+                    "required": ["target"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "tshark",
+                "description": "Capture live network traffic (requires sudo). Default 10s if duration omitted.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "filter": { "type": "string", "description": "BPF capture filter" },
+                        "duration": { "type": "number", "description": "Capture duration in seconds (max 60, default 10)" }
+                    },
+                    "required": []
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "sql",
+                "description": "Query the packet database directly",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "SELECT query to run" }
+                    },
+                    "required": ["query"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "search",
+                "description": "Search the database for IPs, ports, DNS, connections",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "Search query" }
+                    },
+                    "required": ["query"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "websearch",
+                "description": "Search the internet for information",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "Search query" }
+                    },
+                    "required": ["query"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "webfetch",
+                "description": "Fetch a webpage",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": { "type": "string", "description": "URL to fetch" }
+                    },
+                    "required": ["url"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "scan_ip",
+                "description": "Run nmap ping sweep + port/version scan on a single IP. Updates belief system.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "target": { "type": "string", "description": "IP address to scan" }
+                    },
+                    "required": ["target"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "get_beliefs",
+                "description": "Get current belief distribution for all tracked or a specific IP: BOT/IOT/CAM/CLEAN/UNK probabilities + entropy.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "target": { "type": "string", "description": "Optional IP to query (omit for all)" }
+                    },
+                    "required": []
+                }
+            }
+        }),
+    ];
+
     loop {
+        // Drain scanner events before showing prompt
+        loop {
+            match scanner_rx.try_recv() {
+                Ok(ScannerEvent::ScanStarted { ip, tool }) => {
+                    println!("  [Scanner] {} scanning {}...", tool, ip);
+                }
+                Ok(ScannerEvent::ScanComplete { ip, result }) => {
+                    let status = if result.is_alive { "up" } else { "down" };
+                    let ports = if result.open_ports.is_empty() {
+                        "no ports".to_string()
+                    } else {
+                        format!("ports: {:?}", result.open_ports)
+                    };
+                    let os = result.os_hint.as_deref().unwrap_or("");
+                    println!("  [Scanner] {} → {} ({}, {})",
+                        ip, status, ports,
+                        if os.is_empty() { "no OS info" } else { os },
+                    );
+                    if let Ok(sys) = beliefs.lock() {
+                        if let Some(line) = sys.format_ip(&ip) {
+                            println!("  [↻] {}", line);
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+
         print!("you> ");
         io::stdout().flush().ok();
         input.clear();
@@ -872,78 +1126,209 @@ fn run_chat(db_path: &Path, model: &str) {
         if question.is_empty() { continue; }
         if question == "quit" || question == "exit" || question == "q" { break; }
 
-        // /search commands go to search engine
-        if question.starts_with('/') {
-            let search_cmd = &question[1..];
-            search_execute(&conn, search_cmd);
+        // /commands
+        if let Some(cmd) = question.strip_prefix('/') {
+            match cmd {
+                "beliefs" | "belief" => {
+                    let sys = beliefs.lock().unwrap();
+                    println!("═══ Beliefs ═══");
+                    println!("{}", sys.format_all());
+                }
+                cmd if cmd.starts_with("scan ") => {
+                    let ip = cmd[5..].trim();
+                    if ip.is_empty() {
+                        println!("  Usage: /scan <IP>");
+                    } else {
+                        println!("  [Manual] Scanning {}...", ip);
+                        let is_alive = scanner::ping_sweep(ip);
+                        let open_ports = if is_alive {
+                            scanner::version_scan(ip)
+                        } else {
+                            Vec::new()
+                        };
+                        let os_hint = if is_alive && !open_ports.is_empty() {
+                            Some(scanner::guess_os_from_ports(&open_ports))
+                        } else {
+                            None
+                        };
+                        {
+                            let mut sys = beliefs.lock().unwrap();
+                            sys.ensure_ip(ip);
+                            sys.update_from_nmap(ip, is_alive, &open_ports);
+                        }
+                        println!("  [Manual] {} → {} (ports: {:?}) {}",
+                            ip,
+                            if is_alive { "up" } else { "down" },
+                            open_ports,
+                            os_hint.as_deref().unwrap_or(""),
+                        );
+                        if let Ok(sys) = beliefs.lock() {
+                            if let Some(line) = sys.format_ip(ip) {
+                                println!("  [↻] {}", line);
+                            }
+                        }
+                    }
+                }
+                _ => search_execute(&conn, cmd),
+            }
             continue;
         }
 
-        // Build prompt with conversation history
-        let mut prompt = format!("{}\n\n## Conversation\n", system_prompt);
-        let start = conversation.len().saturating_sub(5);
-        for (q, a) in &conversation[start..] {
-            prompt.push_str(&format!("User: {}\nAssistant: {}\n\n", q, a));
-        }
-        prompt.push_str(&format!("User: {}\nAssistant:", question));
+        // Add user message
+        messages.push(json!({"role": "user", "content": question}));
 
-        // Get AI response
+        // Get AI response with tool calling
         print!("  ");
         io::stdout().flush().ok();
 
-        let response = match ollama.generate(&prompt) {
+        let response = match ollama.chat(&messages, &tools) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("\n[Error] {}", e);
                 println!("  [AI unavailable — try /help or 'quit']");
+                messages.pop(); // remove failed user message
                 continue;
             }
         };
 
-        // Check for tool calls in response
-        if let Some(tool_result) = extract_and_run_tool(&response, &conn, db_path) {
-            println!("\n{}", response);
-            println!("\n  [Tool executed: {}]", tool_result.tool_name);
-            println!("  {}", tool_result.summary);
+        let content = response["content"].as_str().unwrap_or("").to_string();
+        let tool_calls = response["tool_calls"].as_array().cloned().unwrap_or_default();
 
-            // Feed results back to AI for analysis
-            let follow_up = format!(
-                "The tool returned these results:\n\n{}\n\n\
-                 Analyze these results and continue your analysis. \
-                 If you need more data, use another tool.",
-                tool_result.output
-            );
-            let mut prompt2 = format!("{}\n\n## Conversation\n", system_prompt);
-            let start2 = conversation.len().saturating_sub(5);
-            for (q, a) in &conversation[start2..] {
-                prompt2.push_str(&format!("User: {}\nAssistant: {}\n\n", q, a));
+        // No tool calls — just a text response
+        if tool_calls.is_empty() {
+            messages.push(json!({"role": "assistant", "content": content}));
+            println!();
+            continue;
+        }
+
+        // Process tool calls
+        messages.push(json!({"role": "assistant", "content": content, "tool_calls": tool_calls}));
+
+        for tc in &tool_calls {
+            let name = tc["function"]["name"].as_str().unwrap_or("");
+            let args = tc["function"]["arguments"].clone();
+            let args_str = format!("{}", args);
+
+            let call = ToolCall {
+                name: name.to_string(),
+                description: args_str.clone(),
+                args: tc.clone(),  // pass the whole tool call object
+            };
+
+            if ask_permission(&call) {
+                let tool_result = execute_tool_call(&call, &conn, db_path);
+                println!("  [Tool: {}] {}", tool_result.tool_name, tool_result.summary);
+
+                let formatted = format!("[OK] {}: {}\n{}",
+                    tool_result.tool_name, tool_result.summary, tool_result.output);
+                messages.push(json!({
+                    "role": "tool",
+                    "content": formatted,
+                }));
+            } else {
+                println!("  [Tool denied]");
+                let denied = format!("[DENIED] User denied {}: {}", name, call.description);
+                messages.push(json!({
+                    "role": "tool",
+                    "content": denied,
+                }));
             }
-            prompt2.push_str(&format!("User: {}\nAssistant: {}\n\n{}", question, response, follow_up));
+        }
 
-            print!("  ");
-            io::stdout().flush().ok();
-
-            match ollama.generate(&prompt2) {
-                Ok(follow_response) => {
-                    println!("\n{}", follow_response);
-                    conversation.push((question, format!("{}\n\n[Tool: {}]\n{}", response, tool_result.tool_name, follow_response)));
-                }
-                Err(e) => {
-                    eprintln!("\n[Error on follow-up]: {}", e);
-                    conversation.push((question, response));
-                }
+        // Let model respond to tool results
+        print!("  ");
+        io::stdout().flush().ok();
+        if let Ok(follow) = ollama.chat(&messages, &tools) {
+            let fc = follow["content"].as_str().unwrap_or("").to_string();
+            if !fc.is_empty() {
+                messages.push(json!({"role": "assistant", "content": fc}));
             }
-        } else {
-            println!("{}", response);
-            conversation.push((question, response));
         }
         println!();
     }
 
-    println!("\n[System] Chat ended. {} exchanges recorded.", conversation.len());
+    println!("\n[System] Chat ended. {} messages recorded.", messages.len());
 }
 
 // ── Tool System ──────────────────────────────────────────────
+
+/// A parsed tool call (before execution)
+struct ToolCall {
+    name: String,
+    description: String,
+    args: Value,
+}
+
+/// Ask user permission before executing a tool
+fn ask_permission(call: &ToolCall) -> bool {
+    if ALWAYS_ALLOW.load(Ordering::Relaxed) {
+        return true;
+    }
+    // Format args nicely
+    let args_str = match &call.args {
+        Value::Object(map) => {
+            let parts: Vec<String> = map.iter()
+                .map(|(k, v)| {
+                    let val = match v {
+                        Value::String(s) => s.clone(),
+                        other => format!("{}", other),
+                    };
+                    format!("{}={}", k, val)
+                })
+                .collect();
+            parts.join(" ")
+        }
+        _ => format!("{}", call.args),
+    };
+    let display = format!("{} {}", call.name, args_str);
+    let w = 58;
+    let display = &display[..display.len().min(w)];
+    println!();
+    println!("  ┌{0:─<1$}┐", "", w + 2);
+    println!("  │ {:<width$} │", display, width = w);
+    println!("  ├{0:─<1$}┤", "", w + 2);
+    println!("  │ {:<width$} │", "[y] Allow   [a] Always   [n] Deny", width = w);
+    println!("  └{0:─<1$}┘", "", w + 2);
+    print!("  > ");
+    io::stdout().flush().ok();
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).ok();
+    match input.trim().to_lowercase().as_str() {
+        "a" | "always" => {
+            ALWAYS_ALLOW.store(true, Ordering::Relaxed);
+            true
+        }
+        "y" | "yes" => true,
+        _ => false,
+    }
+}
+
+/// Execute a parsed tool call
+fn execute_tool_call(call: &ToolCall, conn: &Connection, db_path: &Path) -> ToolResult {
+    // Try structured tool execution first
+    if let Some(result) = try_exec_tool(&call.args, conn, db_path) {
+        return result;
+    }
+
+    // Fallback: try plain text parsing from description
+    let parts: Vec<&str> = call.description.splitn(2, ' ').collect();
+    if parts.len() == 2 {
+        let cmd = parts[0].trim_matches('`');
+        let args = parts[1].trim().trim_matches('"').trim_matches('\'');
+        match cmd {
+            "nmap" => return run_tool_nmap(args),
+            "tshark" => return run_tool_tshark(args, 10, db_path),
+            "sql" => return run_tool_sql(args, conn),
+            "search" => return run_tool_search(args, conn),
+            "websearch" => return run_tool_websearch(args),
+            "webfetch" => return run_tool_webfetch(args),
+            _ => {}
+        }
+    }
+
+    ToolResult { tool_name: call.name.clone(), summary: "Unknown tool".into(), output: "Failed to parse tool arguments".into() }
+}
 
 struct ToolResult {
     tool_name: String,
@@ -951,87 +1336,144 @@ struct ToolResult {
     output: String,
 }
 
-fn extract_and_run_tool(response: &str, conn: &Connection, db_path: &Path) -> Option<ToolResult> {
-    // Look for JSON tool calls in the response
-    for line in response.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('{') && trimmed.contains("\"tool\"") {
-            if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
-                if let Some(tool) = val.get("tool").and_then(|t| t.as_str()) {
-                    return match tool {
-                        "nmap" => {
-                            let target = val.get("target").and_then(|t| t.as_str()).unwrap_or("");
-                            if !is_valid_target(target) {
-                                return Some(ToolResult {
-                                    tool_name: "nmap".into(),
-                                    summary: "Invalid target".into(),
-                                    output: format!("Rejected: '{}' is not a valid IP/CIDR", target),
-                                });
-                            }
-                            Some(run_tool_nmap(target))
-                        }
-                        "tshark" => {
-                            let filter = val.get("filter").and_then(|t| t.as_str()).unwrap_or("");
-                            if !is_valid_bpf(filter) {
-                                return Some(ToolResult {
-                                    tool_name: "tshark".into(),
-                                    summary: "Invalid filter".into(),
-                                    output: format!("Rejected: '{}' contains invalid characters", filter),
-                                });
-                            }
-                            let duration = val.get("duration").and_then(|d| d.as_u64()).unwrap_or(10).min(60);
-                            Some(run_tool_tshark(filter, duration, db_path))
-                        }
-                        "sql" => {
-                            let query = val.get("query").and_then(|q| q.as_str()).unwrap_or("");
-                            if !is_safe_sql(query) {
-                                return Some(ToolResult {
-                                    tool_name: "sql".into(),
-                                    summary: "Rejected unsafe SQL".into(),
-                                    output: "Only SELECT queries are allowed.".into(),
-                                });
-                            }
-                            Some(run_tool_sql(query, conn))
-                        }
-                        "search" => {
-                            let query = val.get("query").and_then(|q| q.as_str()).unwrap_or("");
-                            if !is_safe_search(query) {
-                                return Some(ToolResult {
-                                    tool_name: "search".into(),
-                                    summary: "Invalid search".into(),
-                                    output: "Search contains invalid characters.".into(),
-                                });
-                            }
-                            Some(run_tool_search(query, conn))
-                        }
-                        "webfetch" => {
-                            let url = val.get("url").and_then(|u| u.as_str()).unwrap_or("");
-                            if !url.starts_with("http://") && !url.starts_with("https://") {
-                                return Some(ToolResult {
-                                    tool_name: "webfetch".into(),
-                                    summary: "Invalid URL".into(),
-                                    output: "URL must start with http:// or https://".into(),
-                                });
-                            }
-                            Some(run_tool_webfetch(url))
-                        }
-                        "websearch" => {
-                            let query = val.get("query").and_then(|q| q.as_str()).unwrap_or("");
-                            if query.is_empty() || query.len() > 200 {
-                                return Some(ToolResult {
-                                    tool_name: "websearch".into(),
-                                    summary: "Invalid query".into(),
-                                    output: "Query must be 1-200 characters.".into(),
-                                });
-                            }
-                            Some(run_tool_websearch(query))
-                        }
-                        _ => None,
-                    }
-                }
+/// Try to execute a tool from parsed JSON
+fn try_exec_tool(val: &Value, conn: &Connection, db_path: &Path) -> Option<ToolResult> {
+    // Handle Ollama tool calling format: {"function": {"name": "...", "arguments": {...}}}
+    if let Some(func) = val.get("function") {
+        let tool = func.get("name").and_then(|t| t.as_str())?;
+        let args = func.get("arguments").cloned().unwrap_or(json!({}));
+        return try_exec_tool_named(tool, &args, conn, db_path);
+    }
+    // Handle legacy format: {"tool": "...", ...}
+    let tool = val.get("tool").and_then(|t| t.as_str())?;
+    try_exec_tool_named(tool, val, conn, db_path)
+}
+
+fn try_exec_tool_named(tool: &str, val: &Value, conn: &Connection, db_path: &Path) -> Option<ToolResult> {
+    match tool {
+        "nmap" => {
+            let target = val.get("target").and_then(|t| t.as_str()).unwrap_or("");
+            if !is_valid_target(target) {
+                return Some(ToolResult {
+                    tool_name: "nmap".into(),
+                    summary: "Invalid target".into(),
+                    output: format!("Rejected: '{}' is not a valid IP/CIDR", target),
+                });
             }
+            Some(run_tool_nmap(target))
+        }
+        "tshark" => {
+            let filter = val.get("filter").and_then(|t| t.as_str()).unwrap_or("");
+            if !is_valid_bpf(filter) {
+                return Some(ToolResult {
+                    tool_name: "tshark".into(),
+                    summary: "Invalid filter".into(),
+                    output: format!("Rejected: '{}' contains invalid characters", filter),
+                });
+            }
+            let duration = val.get("duration").and_then(|d| d.as_u64()).unwrap_or(10).min(60);
+            Some(run_tool_tshark(filter, duration, db_path))
+        }
+        "sql" => {
+            let query = val.get("query").and_then(|q| q.as_str()).unwrap_or("");
+            if !is_safe_sql(query) {
+                return Some(ToolResult {
+                    tool_name: "sql".into(),
+                    summary: "Rejected unsafe SQL".into(),
+                    output: "Only SELECT queries are allowed.".into(),
+                });
+            }
+            Some(run_tool_sql(query, conn))
+        }
+        "search" => {
+            let query = val.get("query").and_then(|q| q.as_str()).unwrap_or("");
+            if !is_safe_search(query) {
+                return Some(ToolResult {
+                    tool_name: "search".into(),
+                    summary: "Invalid search".into(),
+                    output: "Search contains invalid characters.".into(),
+                });
+            }
+            Some(run_tool_search(query, conn))
+        }
+        "webfetch" => {
+            let url = val.get("url").and_then(|u| u.as_str()).unwrap_or("");
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                return Some(ToolResult {
+                    tool_name: "webfetch".into(),
+                    summary: "Invalid URL".into(),
+                    output: "URL must start with http:// or https://".into(),
+                });
+            }
+            Some(run_tool_webfetch(url))
+        }
+        "websearch" => {
+            let query = val.get("query").and_then(|q| q.as_str()).unwrap_or("");
+            if query.is_empty() || query.len() > 200 {
+                return Some(ToolResult {
+                    tool_name: "websearch".into(),
+                    summary: "Invalid query".into(),
+                    output: "Query must be 1-200 characters.".into(),
+                });
+            }
+            Some(run_tool_websearch(query))
+        }
+        "scan_ip" => {
+            let target = val.get("target").and_then(|t| t.as_str()).unwrap_or("");
+            if !is_valid_target(target) {
+                return Some(ToolResult {
+                    tool_name: "scan_ip".into(),
+                    summary: "Invalid target".into(),
+                    output: format!("Rejected: '{}' is not a valid IP address", target),
+                });
+            }
+            Some(run_tool_scan_ip(target))
+        }
+        "get_beliefs" => {
+            let target = val.get("target").and_then(|t| t.as_str()).unwrap_or("");
+            let result = run_tool_get_beliefs(if target.is_empty() { None } else { Some(target) });
+            Some(result)
+        }
+        _ => None,
+    }
+}
+
+/// Try to parse and execute a tool from a text snippet
+fn try_parse_tool_text(text: &str, conn: &Connection, db_path: &Path) -> Option<ToolResult> {
+    let trimmed = text.trim();
+
+    // Try JSON first
+    if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
+        if val.get("tool").is_some() {
+            return try_exec_tool(&val, conn, db_path);
         }
     }
+
+    // Try simple tool commands: "toolname args"
+    // Must be short, on one line, no semicolons/pipes
+    if trimmed.len() > 200 { return None; }
+    if trimmed.contains(';') || trimmed.contains('|') || trimmed.contains('`') { return None; }
+
+    let parts: Vec<&str> = trimmed.splitn(2, ' ').collect();
+    if parts.len() != 2 { return None; }
+
+    let cmd = parts[0].trim_matches('`');
+    let args = parts[1].trim().trim_matches('"').trim_matches('\'');
+
+    match cmd {
+        "nmap" if is_valid_target(args) => return Some(run_tool_nmap(args)),
+        "tshark" if is_valid_bpf(args) => return Some(run_tool_tshark(args, 10, db_path)),
+        "sql" if is_safe_sql(args) => return Some(run_tool_sql(args, conn)),
+        "search" if is_safe_search(args) => return Some(run_tool_search(args, conn)),
+        "webfetch" if args.starts_with("http") && !args.contains(';') && !args.contains('|') => {
+            return Some(run_tool_webfetch(args));
+        }
+        "websearch" if !args.is_empty() && args.len() <= 200 && !args.contains(';') && !args.contains('|') => {
+            return Some(run_tool_websearch(args));
+        }
+        _ => {}
+    }
+
     None
 }
 
@@ -1039,12 +1481,15 @@ fn extract_and_run_tool(response: &str, conn: &Connection, db_path: &Path) -> Op
 
 fn is_valid_target(target: &str) -> bool {
     if target.is_empty() || target.len() > 64 { return false; }
-    // Only allow: digits, dots, slashes, commas, hyphens, spaces (for ranges)
-    target.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '/' || c == ',' || c == '-' || c == ' ')
+    // Reject CIDR notation (subnets) — only allow single IPs
+    if target.contains('/') { return false; }
+    // Only allow: digits, dots, commas, hyphens, spaces (for ranges)
+    target.chars().all(|c| c.is_ascii_digit() || c == '.' || c == ',' || c == '-' || c == ' ')
 }
 
 fn is_valid_bpf(filter: &str) -> bool {
-    if filter.is_empty() || filter.len() > 256 { return false; }
+    if filter.is_empty() { return true; } // empty = capture all
+    if filter.len() > 256 { return false; }
     // Reject shell metacharacters
     let dangerous = [';', '|', '&', '`', '$', '(', ')', '{', '}', '<', '>', '\n', '\r', '"', '\''];
     !filter.chars().any(|c| dangerous.contains(&c))
@@ -1065,9 +1510,8 @@ fn is_safe_search(query: &str) -> bool {
 
 fn run_tool_nmap(target: &str) -> ToolResult {
     println!("\n  [Tool] Running nmap on {}...", target);
-    let args = vec!["-sV", "-O", "--open", "-oX", "-", "-T4", target];
-    let output = Command::new("sudo").arg("nmap").args(&args)
-        .stdin(Stdio::inherit())
+    let args = vec!["-sn", "-T5", "--max-retries", "1", "--host-timeout", "5s", target];
+    let output = sudo_cmd("nmap").args(&args)
         .output().expect("Failed to run nmap");
     let xml = String::from_utf8_lossy(&output.stdout);
 
@@ -1084,24 +1528,27 @@ fn run_tool_nmap(target: &str) -> ToolResult {
     }
 }
 
-fn run_tool_tshark(filter: &str, duration: u64, db_path: &Path) -> ToolResult {
-    println!("\n  [Tool] Capturing traffic for {}s (filter: {})...", duration, filter);
-    let mut args = vec!["-i", "en1", "-n", "-l", "-T", "ek", "-f", "not host 127.0.0.1"];
+fn run_tool_tshark(filter: &str, duration: u64, _db_path: &Path) -> ToolResult {
+    let iface = load_config().interface;
+    println!("\n  [Tool] Capturing traffic for {}s (interface: {}, filter: {})...", duration, iface, filter);
+    let mut args = vec!["-i", &iface, "-n", "-l", "-T", "ek", "-f", "not host 127.0.0.1"];
     if !filter.is_empty() {
-        args = vec!["-i", "en1", "-n", "-l", "-T", "ek", "-f", filter];
+        args = vec!["-i", &iface, "-n", "-l", "-T", "ek", "-f", filter];
     }
-    args.extend(["-e", "frame.time_epoch", "-e", "ip.src", "-e", "ip.dst",
+    args.extend(["-e", "frame.time_epoch", "-e", "frame.len",
+                 "-e", "ip.src", "-e", "ip.dst",
                  "-e", "tcp.srcport", "-e", "tcp.dstport",
                  "-e", "udp.srcport", "-e", "udp.dstport", "-e", "dns.qry.name"]);
 
-    let mut child = Command::new("sudo").args(["tshark"]).args(&args)
+    let mut child = sudo_cmd("tshark").args(&args)
+        .stdin(Stdio::inherit())
         .stdout(Stdio::piped()).stderr(Stdio::null())
         .spawn().expect("Failed to start tshark");
 
     let child_pid = child.id();
     let timer = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs(duration));
-        let _ = Command::new("sudo").args(["kill", "-INT"]).arg(child_pid.to_string()).output();
+        let _ = sudo_cmd("kill").args(["-INT", &child_pid.to_string()]).output();
     });
 
     let mut packets = Vec::new();
@@ -1109,8 +1556,8 @@ fn run_tool_tshark(filter: &str, duration: u64, db_path: &Path) -> ToolResult {
         let reader = std::io::BufReader::new(stdout);
         use std::io::BufRead;
         for line in reader.lines().map_while(|r| r.ok()) {
-            if let Some((_, src, dst, _, _, _, _, dns)) = extract_fields(&line) {
-                let src = src.unwrap_or_default();
+            if let Some((_, src, dst, _, _, _, _, dns, _)) = extract_fields(&line) {
+                let _src = src.unwrap_or_default();
                 let dst = dst.unwrap_or_default();
                 let dns = dns.map(|d| format!(" [{}]", d)).unwrap_or_default();
                 packets.push(format!("→ {}{}", dst, dns));
@@ -1132,8 +1579,9 @@ fn run_tool_tshark(filter: &str, duration: u64, db_path: &Path) -> ToolResult {
 fn run_tool_sql(query: &str, conn: &Connection) -> ToolResult {
     println!("\n  [Tool] Running SQL: {}", query);
 
-    // Additional safety: block multiple statements
-    if query.contains(';') {
+    // Additional safety: block multiple statements (more than one semicolon)
+    let semicolon_count = query.chars().filter(|&c| c == ';').count();
+    if semicolon_count > 1 {
         return ToolResult {
             tool_name: "sql".into(),
             summary: "Rejected multi-statement query".into(),
@@ -1200,7 +1648,7 @@ fn run_tool_search(query: &str, conn: &Connection) -> ToolResult {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
             }).unwrap();
             for row in rows {
-                let (epoch, src, dst, port, dns): (Option<f64>, Option<String>, Option<String>, Option<i32>, Option<String>) = row.unwrap();
+                let (_epoch, src, dst, port, dns): (Option<f64>, Option<String>, Option<String>, Option<i32>, Option<String>) = row.unwrap();
                 output.push(format!("{} → {} port:{} dns:{}", src.unwrap_or_default(), dst.unwrap_or_default(), port.unwrap_or(0), dns.unwrap_or_default()));
             }
         }
@@ -1288,6 +1736,86 @@ fn run_tool_websearch(query: &str) -> ToolResult {
     }
 }
 
+fn run_tool_scan_ip(target: &str) -> ToolResult {
+    println!("\n  [Tool] Scanning {} (ports + OS)...", target);
+    let is_alive = scanner::ping_sweep(target);
+    let open_ports = if is_alive { scanner::version_scan(target) } else { Vec::new() };
+    let os_real = if is_alive { scanner::os_scan(target) } else { None };
+    let os_hint = if let Some(ref os) = os_real {
+        os.clone()
+    } else if is_alive && !open_ports.is_empty() {
+        scanner::guess_os_from_ports(&open_ports)
+    } else {
+        "unknown".to_string()
+    };
+    if let Some(beliefs) = BELIEFS.get() {
+        let mut sys = beliefs.lock().unwrap();
+        sys.ensure_ip(target);
+        sys.update_from_nmap(target, is_alive, &open_ports);
+    }
+    let status = if is_alive { "up" } else { "down" };
+    let ports_str = if open_ports.is_empty() {
+        "no open ports".to_string()
+    } else {
+        format!("{} open ports: {:?}", open_ports.len(), open_ports)
+    };
+    ToolResult {
+        tool_name: "scan_ip".into(),
+        summary: format!("{} → {} ({})", target, status, os_hint),
+        output: format!("IP: {}\nStatus: {}\nOS: {}\n{}",
+            target, status, os_hint, ports_str),
+    }
+}
+
+fn run_tool_get_beliefs(target: Option<&str>) -> ToolResult {
+    if let Some(beliefs) = BELIEFS.get() {
+        let sys = beliefs.lock().unwrap();
+        if let Some(ip) = target {
+            if let Some(line) = sys.format_ip(ip) {
+                ToolResult {
+                    tool_name: "get_beliefs".into(),
+                    summary: format!("Beliefs for {}", ip),
+                    output: line,
+                }
+            } else {
+                ToolResult {
+                    tool_name: "get_beliefs".into(),
+                    summary: format!("IP {} not tracked", ip),
+                    output: format!("IP {} has no belief data. Use scan_ip to start tracking.", ip),
+                }
+            }
+        } else {
+            let output = sys.format_all();
+            ToolResult {
+                tool_name: "get_beliefs".into(),
+                summary: format!("Beliefs for {} IPs", sys.len()),
+                output,
+            }
+        }
+    } else {
+        ToolResult {
+            tool_name: "get_beliefs".into(),
+            summary: "Belief system not initialized".into(),
+            output: "Belief system is not available. Run in chat mode.".into(),
+        }
+    }
+}
+
+fn sudo_cmd(prog: &str) -> Command {
+    let is_root = std::process::Command::new("id").arg("-u").output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false);
+    if is_root {
+        Command::new(prog)
+    } else {
+        let mut c = Command::new("sudo");
+        c.arg(prog);
+        c
+    }
+}
+
 fn extract_search_results(html: &str) -> Vec<String> {
     let mut results = Vec::new();
     // Simple extraction: find <a> tags with href and text
@@ -1347,7 +1875,7 @@ fn extract_search_results(html: &str) -> Vec<String> {
         let cleaned = html.replace("<script>", "").replace("</script>", "")
             .replace("<style>", "").replace("</style>", "");
         let text_only = cleaned
-            .split(|c: char| c == '<' || c == '>')
+            .split(['<', '>'])
             .map(|s| s.trim())
             .filter(|s| s.len() > 20 && !s.starts_with("http"))
             .take(5)
@@ -1371,7 +1899,7 @@ struct NetworkContext {
 }
 
 fn build_network_context(db_path: &Path) -> NetworkContext {
-    let conn = open_db(db_path);
+    let conn = init_db(db_path);
     let total: u64 = conn.query_row("SELECT COUNT(*) FROM packets", [], |r| r.get(0)).unwrap_or(0);
     eprint!("[System] Loading {} packets...", total);
     let packets = load_from_db(&conn);
@@ -1405,9 +1933,31 @@ fn build_network_context(db_path: &Path) -> NetworkContext {
 fn format_context_for_ai(ctx: &NetworkContext) -> String {
     let mut parts = Vec::new();
 
+    parts.push("## Flag Definitions (all 18 types detected by the correlation engine)\n\
+        [BROWSER] = Web browser: HTTPS+DNS to many domains, ephemeral ports, browser CDNs\n\
+        [BOT] = Confirmed botnet: precision beacon interval (CV<0.1), autocorrelation, monotonic port, minimal DNS\n\
+        [SERVER] = Server: many unique clients, privileged ports, inbound > outbound, long sessions\n\
+        [IOT] = IoT device: UPnP/mDNS/multicast ports, few external IPs, low pps, heartbeat, UDP-dominant\n\
+        [DNS_PROFILER] = DNS profiler: high qps (>8), many unique domains (>60), probes without connecting, single-label (DGA) queries\n\
+        [BEACON] = Periodic beacon: tight interval (CV<0.05) or jittered (CV 0.05-0.25), single destination, low-payload keep-alive\n\
+        [SCANNER] = Scanner: many unique ports (>20), network sweep (>15 hosts, <2 pkts/host), SYN scan pattern, sequential ports\n\
+        [STREAMING] = Streaming media: sustained high volume, UDP-dominant, streaming CDN domains, high pps\n\
+        [CLOUD_SYNC] = Cloud sync: repeated DNS to cloud domains, steady bidirectional traffic\n\
+        [VPN] = VPN tunnel: VPN ports (1194/4500/500/1723/8443), single destination tunnel, uniform encrypted packet sizes\n\
+        [TOR] = Tor: Tor ports (9001/9030/9150), relay behavior (many source IPs), long-lived circuits\n\
+        [GAME] = Game client: game ports, bursty pattern, 10-200 pps, UDP-dominant\n\
+        [LATERAL_MOVEMENT] = Lateral movement: connects to 4+ internal hosts, management ports, rapid scanning\n\
+        [DATA_EXFIL] = Data exfiltration: high outbound ratio (>8:1), single external IP concentration, minimal DNS, sustained\n\
+        [C2_BEACON] = C2 beacon: regular/jittered beacon to single external IP, minimal DNS, small payloads, recon-scale volume\n\
+        [NET_RECON] = Network recon: probes management ports (22/23/80/443/3389/5900/2323/9100), light touch (<5 pkts/host), unanswered probes, no DNS\n\
+        [PRINTER_IOT] = Printer/IoT: printer ports (9100/631), IoT signal ports, very low rate (<2 pps), vendor keywords match, UDP-dominant\n\
+        [UNKNOWN] = No detector matched (report basic packet/DNS stats)\n\n\
+        Confidence: each detector starts at 0.0 and adds 0.1-0.5 per signal that triggers; emitted if >= 0.35, capped at 1.0.\n\
+        Detail: semicolon-separated list of indicators that contributed to the finding.".to_string());
+
     if !ctx.devices.is_empty() {
         parts.push(format!("## Known Devices ({})\n{}", ctx.devices.len(),
-            ctx.devices.iter().map(|(ip, mac, hostname, vendor, os, ports)| {
+            ctx.devices.iter().map(|(ip, mac, hostname, _vendor, _os, ports)| {
                 format!("{} | {} | {} | Ports: {}",
                     ip,
                     mac.as_deref().unwrap_or("?"),
@@ -1702,7 +2252,7 @@ fn run_devices(db_path: &Path) {
 
     println!("═══ KNOWN DEVICES ═══");
     for row in rows {
-        let (ip, mac, hostname, vendor, os_guess, ports): (String, Option<String>, Option<String>, Option<String>, Option<String>, String) = row.unwrap();
+        let (ip, _mac, hostname, _vendor, os_guess, ports): (String, Option<String>, Option<String>, Option<String>, Option<String>, String) = row.unwrap();
         println!("  {} ({}) — {} [{}]",
             ip,
             hostname.unwrap_or_default(),
@@ -1864,7 +2414,7 @@ fn search_execute(conn: &Connection, query: &str) {
             }).unwrap();
             println!("Known devices:");
             for row in rows {
-                let (ip, mac, hostname, vendor, os_guess, ports): (String, Option<String>, Option<String>, Option<String>, Option<String>, String) = row.unwrap();
+                let (ip, _mac, hostname, _vendor, os_guess, ports): (String, Option<String>, Option<String>, Option<String>, Option<String>, String) = row.unwrap();
                 println!("  {} ({}) — {} [{}]",
                     ip,
                     hostname.unwrap_or_default(),
@@ -1938,7 +2488,7 @@ fn search_execute(conn: &Connection, query: &str) {
             let mut stmt = conn.prepare(
                 "SELECT ports FROM devices WHERE ip LIKE ?1"
             ).unwrap();
-            let rows = stmt.query_map(params![format!("%{}%", arg)], |r| Ok(r.get::<_, String>(0)?)).unwrap();
+            let rows = stmt.query_map(params![format!("%{}%", arg)], |r| r.get::<_, String>(0)).unwrap();
             for row in rows {
                 let ports = row.unwrap();
                 if !ports.is_empty() {
@@ -2032,7 +2582,7 @@ fn main() {
                 println!("[System] AI disabled in config. Entering search mode.");
                 run_search(&db_path, None);
             } else {
-                run_chat(&db_path, mdl);
+                run_chat(&db_path, mdl, false);
             }
         }
         Commands::Scan { target, output } => {
@@ -2046,7 +2596,7 @@ fn main() {
             let db_path = default_db_path(false, output.as_deref());
             let conn = init_db(&db_path);
             let args = vec!["-sV", "-O", "-sC", "--open", "-oX", "-", "-T4", &tgt];
-            let output = Command::new("sudo").arg("nmap").args(&args)
+            let output = sudo_cmd("nmap").args(&args)
                 .stdin(Stdio::inherit())
                 .output().expect("Failed to run nmap");
             let xml_str = String::from_utf8_lossy(&output.stdout);
