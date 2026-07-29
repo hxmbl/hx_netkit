@@ -1,1 +1,28 @@
+# Rust
 target/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config with secrets
+opencode.json
+
+# Env files
+.env
+.env.*
+
+# Temp/test databases
+*.db
+*.db-journal
+
+# Capture files
+*.pcap
+*.pcapng
