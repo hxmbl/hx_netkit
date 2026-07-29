@@ -41,7 +41,7 @@ jobs:
           working-directory: tools/correlator
           command: build
           target: ${{ matrix.platform.target }}
-          args: "--locked --release"
+          args: "--release"
           strip: true
 
       - name: Publish artifacts and release
