@@ -363,10 +363,17 @@ pub fn run_tool_sql(query: &str, conn: &Connection) -> ToolResult {
     match conn.prepare(query) {
         Ok(mut stmt) => {
             let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
-            let mut rows = stmt.query([]).unwrap();
+            let mut rows = match stmt.query([]) {
+                Ok(r) => r,
+                Err(e) => return ToolResult {
+                    tool_name: "sql".into(),
+                    summary: "Query execution failed".into(),
+                    output: format!("Error: {}", e),
+                },
+            };
             let mut output = vec![cols.join(" | ")];
             let mut count = 0;
-            while let Some(row) = rows.next().unwrap() {
+            while let Ok(Some(row)) = rows.next() {
                 let vals: Vec<String> = (0..cols.len()).map(|i| {
                     row.get::<_, String>(i).unwrap_or_else(|_| "NULL".into())
                 }).collect();
@@ -398,34 +405,40 @@ pub fn run_tool_search(query: &str, conn: &Connection) -> ToolResult {
     match cmd.as_str() {
         "ip" => {
             let pattern = format!("%{}%", arg);
-            let mut stmt = conn.prepare(
+            if let Ok(mut stmt) = conn.prepare(
                 "SELECT epoch, ip_src, ip_dst, tcp_dst_port, dns_query FROM packets WHERE ip_src LIKE ?1 OR ip_dst LIKE ?1 ORDER BY epoch DESC LIMIT 20"
-            ).unwrap();
-            let rows = stmt.query_map(params![pattern], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-            }).unwrap();
-            for row in rows {
-                let (_epoch, src, dst, port, dns): (Option<f64>, Option<String>, Option<String>, Option<i32>, Option<String>) = row.unwrap();
-                output.push(format!("{} → {} port:{} dns:{}", src.unwrap_or_default(), dst.unwrap_or_default(), port.unwrap_or(0), dns.unwrap_or_default()));
+            ) {
+                if let Ok(rows) = stmt.query_map(params![pattern], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                }) {
+                    for row in rows.flatten() {
+                        let (_epoch, src, dst, port, dns): (Option<f64>, Option<String>, Option<String>, Option<i32>, Option<String>) = row;
+                        output.push(format!("{} → {} port:{} dns:{}", src.unwrap_or_default(), dst.unwrap_or_default(), port.unwrap_or(0), dns.unwrap_or_default()));
+                    }
+                }
             }
         }
         "devices" => {
-            let mut stmt = conn.prepare("SELECT ip, os_guess, ports FROM devices").unwrap();
-            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
-            for row in rows {
-                let (ip, os, ports): (String, Option<String>, String) = row.unwrap();
-                output.push(format!("{} [{}] {}", ip, os.unwrap_or_default(), ports));
+            if let Ok(mut stmt) = conn.prepare("SELECT ip, os_guess, ports FROM devices") {
+                if let Ok(rows) = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))) {
+                    for row in rows.flatten() {
+                        let (ip, os, ports): (String, Option<String>, String) = row;
+                        output.push(format!("{} [{}] {}", ip, os.unwrap_or_default(), ports));
+                    }
+                }
             }
         }
         "connections" => {
             let pattern = format!("%{}%", arg);
-            let mut stmt = conn.prepare(
+            if let Ok(mut stmt) = conn.prepare(
                 "SELECT ip_dst, COUNT(*) as cnt FROM packets WHERE ip_src LIKE ?1 GROUP BY ip_dst ORDER BY cnt DESC LIMIT 10"
-            ).unwrap();
-            let rows = stmt.query_map(params![pattern], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
-            for row in rows {
-                let (ip, count): (String, u64) = row.unwrap();
-                output.push(format!("→ {} (×{})", ip, count));
+            ) {
+                if let Ok(rows) = stmt.query_map(params![pattern], |r| Ok((r.get(0)?, r.get(1)?))) {
+                    for row in rows.flatten() {
+                        let (ip, count): (String, u64) = row;
+                        output.push(format!("→ {} (×{})", ip, count));
+                    }
+                }
             }
         }
         _ => {
@@ -503,9 +516,10 @@ pub fn run_tool_scan_ip(target: &str) -> ToolResult {
         "unknown".to_string()
     };
     if let Some(beliefs) = BELIEFS.get() {
-        let mut sys = beliefs.lock().unwrap();
-        sys.ensure_ip(target);
-        sys.update_from_nmap(target, is_alive, &open_ports);
+        if let Ok(mut sys) = beliefs.lock() {
+            sys.ensure_ip(target);
+            sys.update_from_nmap(target, is_alive, &open_ports);
+        }
     }
     let status = if is_alive { "up" } else { "down" };
     let ports_str = if open_ports.is_empty() {
@@ -522,27 +536,34 @@ pub fn run_tool_scan_ip(target: &str) -> ToolResult {
 
 pub fn run_tool_get_beliefs(target: Option<&str>) -> ToolResult {
     if let Some(beliefs) = BELIEFS.get() {
-        let sys = beliefs.lock().unwrap();
-        if let Some(ip) = target {
-            if let Some(line) = sys.format_ip(ip) {
-                ToolResult {
-                    tool_name: "get_beliefs".into(),
-                    summary: format!("Beliefs for {}", ip),
-                    output: line,
+        if let Ok(sys) = beliefs.lock() {
+            if let Some(ip) = target {
+                if let Some(line) = sys.format_ip(ip) {
+                    ToolResult {
+                        tool_name: "get_beliefs".into(),
+                        summary: format!("Beliefs for {}", ip),
+                        output: line,
+                    }
+                } else {
+                    ToolResult {
+                        tool_name: "get_beliefs".into(),
+                        summary: format!("IP {} not tracked", ip),
+                        output: format!("IP {} has no belief data. Use scan_ip to start tracking.", ip),
+                    }
                 }
             } else {
+                let output = sys.format_all();
                 ToolResult {
                     tool_name: "get_beliefs".into(),
-                    summary: format!("IP {} not tracked", ip),
-                    output: format!("IP {} has no belief data. Use scan_ip to start tracking.", ip),
+                    summary: format!("Beliefs for {} IPs", sys.len()),
+                    output,
                 }
             }
         } else {
-            let output = sys.format_all();
             ToolResult {
                 tool_name: "get_beliefs".into(),
-                summary: format!("Beliefs for {} IPs", sys.len()),
-                output,
+                summary: "Belief system locked".into(),
+                output: "Could not access belief system. Try again.".into(),
             }
         }
     } else {
@@ -657,8 +678,15 @@ fn run_tool_packets(ip: &str, limit: usize, direction: &str, peer: &str, port: u
     let mut count = 0u64;
     let mut sample_lines = Vec::new();
 
-    let mut rows = stmt.query([]).unwrap();
-    while let Some(row) = rows.next().unwrap() {
+    let mut rows = match stmt.query([]) {
+        Ok(r) => r,
+        Err(e) => return ToolResult {
+            tool_name: "packets".into(),
+            summary: "Query failed".into(),
+            output: format!("SQL error: {}", e),
+        },
+    };
+    while let Ok(Some(row)) = rows.next() {
         count += 1;
         let epoch: f64 = row.get(0).unwrap_or(0.0);
         let src: Option<String> = row.get(1).unwrap_or(None);

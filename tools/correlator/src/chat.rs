@@ -36,8 +36,7 @@ pub fn run_chat(db_path: &Path, model: &str, live_mode: bool, stealth_level: u8)
     let context_str = format_context_for_ai(&ctx);
 
     let beliefs = Arc::new(Mutex::new(BeliefSystem::new()));
-    {
-        let mut sys = beliefs.lock().unwrap();
+    if let Ok(mut sys) = beliefs.lock() {
         sys.initialize_from_findings(&ctx.findings);
         for ip in ctx.profiles.keys() {
             sys.ensure_ip(ip);
@@ -50,15 +49,15 @@ pub fn run_chat(db_path: &Path, model: &str, live_mode: bool, stealth_level: u8)
     let _scanner_thread = start_scanner(scanner_beliefs, scanner_tx, config.interface.clone(), stealth_level);
 
     let belief_context = {
-        let sys = beliefs.lock().unwrap();
         let top = ctx.findings.iter().take(5).map(|f| f.ip.as_str()).collect::<Vec<_>>();
+        let ip_count = beliefs.lock().map(|sys| sys.len()).unwrap_or(0);
         format!("\n\n## Belief System\n\
             Each IP tracked with 5-category distribution: BOT, IOT, CAMERA, CLEAN, UNKNOWN.\n\
             Confidence is % probability. Entropy bits = uncertainty level (higher = less certain).\n\
             IPs with <90% confidence in any category are auto-scanned in background.\n\
             Top flagged IPs: {}. {} total IPs tracked.\n\
             Use get_beliefs tool to query current state.",
-            top.join(", "), sys.len())
+            top.join(", "), ip_count)
     };
 
     let system_prompt = if live_mode {
@@ -79,10 +78,7 @@ pub fn run_chat(db_path: &Path, model: &str, live_mode: bool, stealth_level: u8)
         ctx.devices.len(), ctx.packet_count, ctx.findings.len());
     println!("[System] Tools: packets, nmap, tshark, sql, search, webfetch, websearch, scan_ip, get_beliefs");
     println!("[System] Belief tracker: scanning {} IPs in background (use /beliefs to see)\n",
-        {
-            let sys = beliefs.lock().unwrap();
-            sys.len()
-        });
+        beliefs.lock().map(|sys| sys.len()).unwrap_or(0));
 
     let conn = open_db(db_path);
     let mut messages: Vec<Value> = Vec::new();
@@ -150,9 +146,10 @@ pub fn run_chat(db_path: &Path, model: &str, live_mode: bool, stealth_level: u8)
         if let Some(cmd) = question.strip_prefix('/') {
             match cmd {
                 "beliefs" | "belief" => {
-                    let sys = beliefs.lock().unwrap();
-                    println!("═══ Beliefs ═══");
-                    println!("{}", sys.format_all());
+                    if let Ok(sys) = beliefs.lock() {
+                        println!("═══ Beliefs ═══");
+                        println!("{}", sys.format_all());
+                    }
                 }
                 cmd if cmd.starts_with("scan ") => {
                     let ip = cmd[5..].trim();
@@ -172,9 +169,10 @@ pub fn run_chat(db_path: &Path, model: &str, live_mode: bool, stealth_level: u8)
                             None
                         };
                         {
-                            let mut sys = beliefs.lock().unwrap();
-                            sys.ensure_ip(ip);
-                            sys.update_from_nmap(ip, is_alive, &open_ports);
+                            if let Ok(mut sys) = beliefs.lock() {
+                                sys.ensure_ip(ip);
+                                sys.update_from_nmap(ip, is_alive, &open_ports);
+                            }
                         }
                         println!("  [Manual] {} → {} (ports: {:?}) {}",
                             ip,
