@@ -6,7 +6,7 @@ A Rust workspace for network intelligence tooling.
 
 | Tool | Description |
 |------|-------------|
-| [correlator](tools/correlator/) | Scan, capture, and interrogate network traffic with local AI |
+| [correlator](tools/correlator/) | Scan, capture, and interrogate network traffic with (optional!!) local AI |
 
 ## Quick Start
 
