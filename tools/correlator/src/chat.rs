@@ -64,18 +64,20 @@ pub fn run_chat(db_path: &Path, model: &str, live_mode: bool, stealth_level: u8)
     let system_prompt = if live_mode {
         "LIVE CAPTURE — packets are arriving now. You already have a network summary in context.\n\
          Answer overview questions from that summary first (devices, findings, top talkers).\n\
-         Use tools only when you need live/fresh data: sql, search, scan_ip, get_beliefs, nmap, tshark, websearch, webfetch.\n\
+         Use tools when you need deeper data: packets (evidence for an IP), sql, search, scan_ip, get_beliefs, nmap, tshark, websearch, webfetch.\n\
+         The packets tool lets you pull raw evidence for any IP — use it to verify findings or investigate suspicious behavior.\n\
          scan_ip takes a single IP (never a CIDR). Be brief."
     } else {
         "You are a network analyst. A capture summary is already in context (devices, stats, top talkers, findings).\n\
          For questions like \"what's happening on the network?\" or \"which are bots?\", answer from the summary first.\n\
-         Use tools only when the summary is insufficient: sql, search, scan_ip (single IP only), get_beliefs, nmap, tshark, websearch, webfetch.\n\
+         Use tools when the summary is insufficient: packets (evidence for an IP), sql, search, scan_ip, get_beliefs, nmap, tshark, websearch, webfetch.\n\
+         The packets tool is your direct line to raw packet data — use it to verify findings, trace connections, or investigate anomalies.\n\
          Never tell the user to run commands. Be brief and concrete."
     };
 
     println!("\n[System] Chat ready. {} devices, {} packets, {} findings loaded.",
         ctx.devices.len(), ctx.packet_count, ctx.findings.len());
-    println!("[System] Tools: nmap, tshark, sql, search, webfetch, websearch, scan_ip, get_beliefs");
+    println!("[System] Tools: packets, nmap, tshark, sql, search, webfetch, websearch, scan_ip, get_beliefs");
     println!("[System] Belief tracker: scanning {} IPs in background (use /beliefs to see)\n",
         {
             let sys = beliefs.lock().unwrap();
@@ -377,6 +379,26 @@ fn tool_definitions() -> Vec<Value> {
                         "target": { "type": "string", "description": "Optional IP to query (omit for all)" }
                     },
                     "required": []
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "packets",
+                "description": "Pull packet evidence for an IP. Returns timestamps, peers, ports, bytes, DNS. Filter by direction, peer, port, or time range.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "ip": { "type": "string", "description": "IP address to investigate" },
+                        "limit": { "type": "number", "description": "Max packets to return (default 20, max 200)" },
+                        "direction": { "type": "string", "description": "Filter: 'in', 'out', or 'both' (default)" },
+                        "peer": { "type": "string", "description": "Only packets to/from this peer IP" },
+                        "port": { "type": "number", "description": "Only packets on this port" },
+                        "after": { "type": "number", "description": "Only packets after this epoch timestamp" },
+                        "before": { "type": "number", "description": "Only packets before this epoch timestamp" }
+                    },
+                    "required": ["ip"]
                 }
             }
         }),

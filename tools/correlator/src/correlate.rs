@@ -2218,9 +2218,15 @@ fn describe_activity(profile: &IpProfile, _findings: &[&Finding]) -> String {
 
     // Direction
     if profile.outbound_count > profile.inbound_count * 3 {
-        parts.push("mostly outbound".to_string());
+        parts.push(format!("mostly outbound ({}/{} ↑↓)", profile.outbound_count, profile.inbound_count));
     } else if profile.inbound_count > profile.outbound_count * 3 {
-        parts.push("mostly inbound".to_string());
+        parts.push(format!("mostly inbound ({}/{} ↑↓)", profile.outbound_count, profile.inbound_count));
+    }
+
+    // Bytes
+    if profile.outbound_bytes > 1_000_000 || profile.inbound_bytes > 1_000_000 {
+        parts.push(format!("heavy payload ({}↑ / {}↓ bytes)",
+            profile.outbound_bytes, profile.inbound_bytes));
     }
 
     // Protocol
@@ -2228,6 +2234,48 @@ fn describe_activity(profile: &IpProfile, _findings: &[&Finding]) -> String {
         parts.push(format!("UDP-dominant ({} UDP vs {} TCP)", profile.udp_count, profile.tcp_count));
     } else if profile.tcp_count > profile.udp_count * 2 {
         parts.push(format!("TCP-dominant ({} TCP vs {} UDP)", profile.tcp_count, profile.udp_count));
+    }
+
+    // Session patterns
+    let long_sessions = profile.sessions.values()
+        .filter(|s| s.last_packet - s.first_packet > 30.0).count();
+    let total_sessions = profile.sessions.len();
+    if total_sessions > 0 {
+        if long_sessions > 3 {
+            parts.push(format!("{} sessions ({} long-lived >30s)", total_sessions, long_sessions));
+        } else if total_sessions > 10 {
+            parts.push(format!("{} distinct sessions", total_sessions));
+        }
+    }
+
+    // Port diversity — what kind of ports
+    let privileged = profile.src_ports.keys().filter(|p| **p < 1024).count();
+    let _ephemeral = profile.src_ports.keys().filter(|p| **p >= 49152).count();
+    if privileged > 0 {
+        parts.push(format!("listening on {} privileged ports", privileged));
+    }
+    if profile.dest_port_entropy > 3.0 {
+        parts.push(format!("very diverse destination ports (entropy: {:.1})", profile.dest_port_entropy));
+    }
+
+    // Connection pattern — few deep vs many shallow
+    if !profile.dest_ips.is_empty() {
+        let avg_pkts_per_dest = profile.outbound_count as f64 / profile.dest_ips.len() as f64;
+        if avg_pkts_per_dest > 50.0 {
+            parts.push(format!("deep connections to {} hosts ({:.0} pkts/dest)", profile.dest_ips.len(), avg_pkts_per_dest));
+        } else if avg_pkts_per_dest < 3.0 && profile.dest_ips.len() > 10 {
+            parts.push(format!("shallow connections to {} hosts ({:.1} pkts/dest)", profile.dest_ips.len(), avg_pkts_per_dest));
+        }
+    }
+
+    // Packet size patterns
+    if profile.packet_count > 20 {
+        let stddev = profile.packet_size_variance.sqrt();
+        if stddev < 50.0 && profile.avg_packet_size > 100.0 {
+            parts.push(format!("uniform packet sizes (~{:.0}B ± {:.0}B — possible tunnel/VPN)", profile.avg_packet_size, stddev));
+        } else if stddev > 500.0 {
+            parts.push(format!("varied packet sizes ({:.0}B ± {:.0}B — mixed traffic)", profile.avg_packet_size, stddev));
+        }
     }
 
     parts.join(", ")
@@ -2331,22 +2379,37 @@ fn build_narrative(
     _activity: &str,
     temporal: &str,
 ) -> String {
-    let duration = profile.last_seen - profile.first_seen;
-    let pps = if duration > 0.0 { profile.packet_count as f64 / duration } else { 0.0 };
+    let _duration = profile.last_seen - profile.first_seen;
 
-    // Build the story
     let mut narrative = format!("{} is {} on the network. ", device_type, role);
+
+    // Who does it talk to?
+    if !profile.dest_ips.is_empty() {
+        let mut dests: Vec<_> = profile.dest_ips.iter().collect();
+        dests.sort_by(|a, b| b.1.cmp(a.1));
+        let internal = dests.iter().filter(|(ip, _)| is_private_ip(ip)).count();
+        let external = dests.len() - internal;
+        if internal > 0 && external > 0 {
+            narrative.push_str(&format!("Talks to {} internal and {} external hosts. ", internal, external));
+        } else if internal > 0 {
+            narrative.push_str(&format!("Talks to {} internal hosts. ", internal));
+        } else {
+            narrative.push_str(&format!("Talks to {} external hosts. ", external));
+        }
+        let top: Vec<String> = dests.iter().take(3).map(|(ip, c)| format!("{}({})", ip, c)).collect();
+        narrative.push_str(&format!("Top destinations: {}. ", top.join(", ")));
+    }
 
     // What domains?
     if !profile.dns_domains.is_empty() {
         let domain_count = profile.dns_domains.len();
         if domain_count > 30 {
-            narrative.push_str(&format!("It resolved {} unique domains, suggesting extensive web activity. ", domain_count));
+            narrative.push_str(&format!("Resolved {} unique domains — extensive web activity. ", domain_count));
         } else if domain_count > 10 {
-            narrative.push_str(&format!("It resolved {} domains. ", domain_count));
+            narrative.push_str(&format!("Resolved {} domains. ", domain_count));
         } else if domain_count > 0 {
             let top: Vec<&String> = profile.dns_domains.keys().take(3).collect();
-            narrative.push_str(&format!("It primarily contacts {}. ", top.iter().map(|d| d.as_str()).collect::<Vec<_>>().join(", ")));
+            narrative.push_str(&format!("Primarily contacts {}. ", top.iter().map(|d| d.as_str()).collect::<Vec<_>>().join(", ")));
         }
     }
 
@@ -2355,14 +2418,48 @@ fn build_narrative(
         let mut ports: Vec<_> = profile.dest_ports.iter().collect();
         ports.sort_by(|a, b| b.1.cmp(a.1));
         let top_ports: Vec<String> = ports.iter().take(3).map(|(p, c)| format!("{}({})", p, c)).collect();
-        narrative.push_str(&format!("Top destination ports: {}. ", top_ports.join(", ")));
+        narrative.push_str(&format!("Top ports: {}. ", top_ports.join(", ")));
     }
 
-    // How much traffic?
-    if pps > 100.0 {
-        narrative.push_str(&format!("Traffic is very heavy at {:.0} packets/sec. ", pps));
-    } else if pps > 30.0 {
-        narrative.push_str(&format!("Traffic is moderate at {:.1} packets/sec. ", pps));
+    // Session depth
+    let long_sessions = profile.sessions.values()
+        .filter(|s| s.last_packet - s.first_packet > 30.0).count();
+    if long_sessions > 3 {
+        narrative.push_str(&format!("{} long-lived sessions (>30s). ", long_sessions));
+    }
+
+    // Port character
+    let privileged = profile.src_ports.keys().filter(|p| **p < 1024).count();
+    if privileged > 0 {
+        narrative.push_str(&format!("Listening on {} privileged ports. ", privileged));
+    }
+
+    // Packet size story
+    if profile.packet_count > 20 {
+        let stddev = profile.packet_size_variance.sqrt();
+        if stddev < 50.0 && profile.avg_packet_size > 100.0 {
+            narrative.push_str(&format!("Uniform packet sizes (~{:.0}B) suggest encrypted tunnel. ", profile.avg_packet_size));
+        } else if stddev > 500.0 {
+            narrative.push_str(&format!("Highly varied packet sizes ({:.0}B ± {:.0}B) — mixed interactive traffic. ", profile.avg_packet_size, stddev));
+        }
+    }
+
+    // Connection pattern
+    if !profile.dest_ips.is_empty() {
+        let avg = profile.outbound_count as f64 / profile.dest_ips.len() as f64;
+        if avg > 50.0 {
+            narrative.push_str(&format!("Deep connections ({:.0} pkts/dest) — sustained communication. ", avg));
+        } else if avg < 3.0 && profile.dest_ips.len() > 10 {
+            narrative.push_str(&format!("Shallow connections ({:.1} pkts/dest across {} hosts) — scanning or probing. ", avg, profile.dest_ips.len()));
+        }
+    }
+
+    // Traffic volume
+    if profile.outbound_bytes > 1_000_000 {
+        narrative.push_str(&format!("Heavy outbound payload ({} MB). ", profile.outbound_bytes / 1_000_000));
+    }
+    if profile.inbound_bytes > 1_000_000 {
+        narrative.push_str(&format!("Heavy inbound payload ({} MB). ", profile.inbound_bytes / 1_000_000));
     }
 
     // Risk summary
@@ -2372,7 +2469,7 @@ fn build_narrative(
     let has_lateral = findings.iter().any(|f| f.kind == FindingKind::LateralMovement);
 
     if has_c2 || has_exfil || has_scan || has_lateral {
-        narrative.push_str("⚠ This device shows suspicious behavior: ");
+        narrative.push_str("⚠ Suspicious: ");
         let mut flags = Vec::new();
         if has_c2 { flags.push("C2 beaconing"); }
         if has_exfil { flags.push("data exfiltration"); }

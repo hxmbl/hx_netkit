@@ -210,6 +210,23 @@ fn try_exec_tool_named(tool: &str, val: &Value, conn: &Connection, db_path: &Pat
             let result = run_tool_get_beliefs(if target.is_empty() { None } else { Some(target) });
             Some(result)
         }
+        "packets" => {
+            let ip = val.get("ip").and_then(|t| t.as_str()).unwrap_or("");
+            let limit = val.get("limit").and_then(|d| d.as_u64()).unwrap_or(20).min(200) as usize;
+            let direction = val.get("direction").and_then(|t| t.as_str()).unwrap_or("both");
+            let peer = val.get("peer").and_then(|t| t.as_str()).unwrap_or("");
+            let port = val.get("port").and_then(|d| d.as_u64()).unwrap_or(0) as u32;
+            let after = val.get("after").and_then(|d| d.as_f64()).unwrap_or(0.0);
+            let before = val.get("before").and_then(|d| d.as_f64()).unwrap_or(0.0);
+            if !is_valid_target(ip) {
+                return Some(ToolResult {
+                    tool_name: "packets".into(),
+                    summary: "Invalid IP".into(),
+                    output: format!("Rejected: '{}' is not a valid IP address", ip),
+                });
+            }
+            Some(run_tool_packets(ip, limit, direction, peer, port, after, before, conn))
+        }
         _ => None,
     }
 }
@@ -592,4 +609,136 @@ fn extract_search_results(html: &str) -> Vec<String> {
     }
 
     results
+}
+
+fn run_tool_packets(ip: &str, limit: usize, direction: &str, peer: &str, port: u32, after: f64, before: f64, conn: &Connection) -> ToolResult {
+    let mut conditions = Vec::new();
+    match direction {
+        "out" => conditions.push(format!("ip_src = '{}'", ip)),
+        "in" => conditions.push(format!("ip_dst = '{}'", ip)),
+        _ => conditions.push(format!("(ip_src = '{}' OR ip_dst = '{}')", ip, ip)),
+    }
+    if !peer.is_empty() {
+        conditions.push(format!("(ip_src = '{}' OR ip_dst = '{}')", peer, peer));
+    }
+    if port > 0 {
+        conditions.push(format!("(tcp_src_port = {} OR tcp_dst_port = {} OR udp_src_port = {} OR udp_dst_port = {})", port, port, port, port));
+    }
+    if after > 0.0 {
+        conditions.push(format!("epoch > {}", after));
+    }
+    if before > 0.0 {
+        conditions.push(format!("epoch < {}", before));
+    }
+    let where_clause = conditions.join(" AND ");
+    let sql = format!("SELECT epoch, ip_src, ip_dst, tcp_src_port, tcp_dst_port, udp_src_port, udp_dst_port, dns_query, frame_len FROM packets WHERE {} ORDER BY epoch DESC LIMIT {}", where_clause, limit);
+
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(e) => return ToolResult {
+            tool_name: "packets".into(),
+            summary: "Query failed".into(),
+            output: format!("SQL error: {}", e),
+        },
+    };
+
+    let mut peer_counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut port_counts: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+    let mut dns_queries: Vec<String> = Vec::new();
+    let mut total_bytes: u64 = 0;
+    let mut count = 0u64;
+    let mut sample_lines = Vec::new();
+
+    let mut rows = stmt.query([]).unwrap();
+    while let Some(row) = rows.next().unwrap() {
+        count += 1;
+        let epoch: f64 = row.get(0).unwrap_or(0.0);
+        let src: Option<String> = row.get(1).unwrap_or(None);
+        let dst: Option<String> = row.get(2).unwrap_or(None);
+        let tcp_sp: Option<u32> = row.get(3).unwrap_or(None);
+        let tcp_dp: Option<u32> = row.get(4).unwrap_or(None);
+        let udp_sp: Option<u32> = row.get(5).unwrap_or(None);
+        let udp_dp: Option<u32> = row.get(6).unwrap_or(None);
+        let dns: Option<String> = row.get(7).unwrap_or(None);
+        let fl: Option<u32> = row.get(8).unwrap_or(None);
+
+        let src_port = tcp_sp.or(udp_sp).unwrap_or(0);
+        let dst_port = tcp_dp.or(udp_dp).unwrap_or(0);
+        let bytes = fl.unwrap_or(0) as u64;
+        total_bytes += bytes;
+
+        let is_out = src.as_deref() == Some(ip);
+        let peer_str = if is_out {
+            dst.clone().unwrap_or_default()
+        } else {
+            src.clone().unwrap_or_default()
+        };
+        let display_port = if is_out { dst_port } else { src_port };
+
+        *peer_counts.entry(peer_str.clone()).or_insert(0) += 1;
+        if display_port > 0 { *port_counts.entry(display_port).or_insert(0) += 1; }
+        if let Some(ref d) = dns { if !dns_queries.contains(d) { dns_queries.push(d.clone()); } }
+
+        if sample_lines.len() < 20 {
+            let dns_str = dns.map(|d| format!(" [{}]", d)).unwrap_or_default();
+            let arrow = if is_out { "↑" } else { "↓" };
+            sample_lines.push(format!("{} {} {}:{} → {}:{}  {}B{}",
+                format_dt(epoch), arrow,
+                src.unwrap_or_default(), src_port,
+                peer_str, dst_port,
+                bytes, dns_str));
+        }
+    }
+
+    let label = match direction {
+        "out" => format!("outbound from {}", ip),
+        "in" => format!("inbound to {}", ip),
+        _ => format!("to/from {}", ip),
+    };
+    let mut output = format!("{} packets {} ({} bytes)\n", count, label, total_bytes);
+
+    if !peer_counts.is_empty() {
+        let mut sorted: Vec<_> = peer_counts.iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(a.1));
+        output.push_str("\nTop peers:\n");
+        for (peer, cnt) in sorted.iter().take(10) {
+            output.push_str(&format!("  {:>5}x  {}\n", cnt, peer));
+        }
+    }
+
+    if !port_counts.is_empty() {
+        let mut sorted: Vec<_> = port_counts.iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(a.1));
+        output.push_str("\nTop ports:\n");
+        for (port, cnt) in sorted.iter().take(10) {
+            output.push_str(&format!("  {:>5}x  port {}\n", cnt, port));
+        }
+    }
+
+    if !dns_queries.is_empty() {
+        output.push_str(&format!("\nDNS ({} unique):\n", dns_queries.len()));
+        for q in dns_queries.iter().take(10) {
+            output.push_str(&format!("  {}\n", q));
+        }
+    }
+
+    output.push_str("\nSample:\n");
+    for line in &sample_lines {
+        output.push_str(&format!("  {}\n", line));
+    }
+
+    ToolResult {
+        tool_name: "packets".into(),
+        summary: format!("{} packets {} — {} peers, {} ports, {} DNS",
+            count, label, peer_counts.len(), port_counts.len(), dns_queries.len()),
+        output,
+    }
+}
+
+fn format_dt(epoch: f64) -> String {
+    let secs = epoch as u64;
+    let s = secs % 60;
+    let m = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    format!("{:02}:{:02}:{:02}", h, m, s)
 }
