@@ -28,4 +28,4 @@ cargo build --release
 
 ## License
 
-Private — internal use only.
+No.
