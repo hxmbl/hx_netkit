@@ -1,0 +1,83 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            label: macos-arm64
+          - target: x86_64-apple-darwin
+            os: macos-13
+            label: macos-x64
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            label: linux-x64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            label: linux-arm64
+            cross: true
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/correlator
+          key: ${{ matrix.target }}
+
+      - name: Build release
+        working-directory: tools/correlator
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      - name: Package
+        run: |
+          cd tools/correlator/target/${{ matrix.target }}/release
+          tar czf ../../../correlator-${{ matrix.label }}.tar.gz correlator
+          cd ../../..
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: correlator-${{ matrix.label }}
+          path: tools/correlator/correlator-${{ matrix.label }}.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: artifacts/*.tar.gz

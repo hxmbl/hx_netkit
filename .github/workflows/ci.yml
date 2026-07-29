@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "tools/correlator/**"
+      - ".github/workflows/ci.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "tools/correlator/**"
+      - ".github/workflows/ci.yml"
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/correlator
+
+      - name: Run tests
+        working-directory: tools/correlator
+        run: cargo test --verbose
+
+      - name: Check warnings
+        working-directory: tools/correlator
+        run: cargo build 2>&1 | grep -i warning && exit 1 || true
