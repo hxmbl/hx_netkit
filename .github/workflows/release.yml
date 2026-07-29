@@ -38,14 +38,29 @@ jobs:
       - name: Build binary
         uses: houseabsolute/actions-rust-cross@v1
         with:
-          working-directory: tools/correlator
           command: build
           target: ${{ matrix.platform.target }}
-          args: "--release"
+          args: "--release --manifest-path tools/correlator/Cargo.toml"
 
-      - name: Publish artifacts and release
-        uses: houseabsolute/actions-rust-release@v0
+      - name: Find binary
+        id: find
+        run: |
+          BIN=$(find . -path "*/target/${{ matrix.platform.target }}/release/correlator" -type f | head -1)
+          if [ -z "$BIN" ]; then
+            BIN=$(find . -path "*/target/release/correlator" -type f | head -1)
+          fi
+          echo "bin=$BIN" >> "$GITHUB_OUTPUT"
+          echo "Found binary: $BIN"
+
+      - name: Package
+        run: |
+          BIN="${{ steps.find.outputs.bin }}"
+          TAG="${GITHUB_REF#refs/tags/}"
+          ARCHIVE="correlator-${TAG}-${{ matrix.platform.target }}.tar.gz"
+          tar czf "$ARCHIVE" -C "$(dirname "$BIN")" correlator
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
         with:
-          working-directory: tools/correlator
-          executable-name: correlator
-          target: ${{ matrix.platform.target }}
+          files: ${{ env.ARCHIVE }}
