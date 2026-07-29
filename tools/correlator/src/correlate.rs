@@ -2703,13 +2703,13 @@ mod tests {
         // 31 timestamps at 60s spacing → 30 intervals of 60.0s → CV=0, mean=60.0
         // This triggers C2_REGULAR (CV<0.15, mean>5.0)
         p.inter_arrival_times = (0..31).map(|i| 1000.0 + i as f64 * 60.0).collect();
-        p.dest_ips.insert("185.100.87.42".into(), 1);
+        p.dest_ips.insert("198.51.100.42".into(), 1);
         p.dns_count = 3;
         p.outbound_count = 7; // avg_out = 7.0/1 = 7.0 < 8.0
         p.dns_domains.insert("evil.com".into(), 1);
         *p.dest_ports.entry(443).or_insert(0) += 7;
         p.sessions.insert(
-            ("192.168.1.50".into(), 49152, "185.100.87.42".into(), 443),
+            ("192.168.1.50".into(), 49152, "198.51.100.42".into(), 443),
             TcpSession { pkt_count: 7, bytes_approx: 3500, ..Default::default() },
         );
 
@@ -3101,7 +3101,7 @@ mod tests {
         for i in 0..30u64 {
             let epoch = base + i as f64 * 60.0;
             conn.execute(
-                "INSERT INTO packets (epoch, ip_src, ip_dst, tcp_dst_port, udp_dst_port, dns_query, frame_len) VALUES (?1,'192.168.1.100','185.100.87.42',443,NULL,NULL,200)",
+                "INSERT INTO packets (epoch, ip_src, ip_dst, tcp_dst_port, udp_dst_port, dns_query, frame_len) VALUES (?1,'192.168.1.100','198.51.100.42',443,NULL,NULL,200)",
                 rusqlite::params![epoch],
             ).unwrap();
         }
