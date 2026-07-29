@@ -2811,4 +2811,195 @@ mod tests {
         let has_streaming = findings.iter().any(|f| f.kind == FindingKind::StreamingMedia);
         assert!(!has_streaming, "streaming detector should NOT fire with corporate mode");
     }
+
+    // ── Integration Tests ──
+
+    use crate::db::init_db;
+    use crate::context::build_network_context;
+
+    fn build_clean_db(path: &std::path::Path) {
+        let conn = init_db(path);
+        // Normal workstation: browsing, DNS queries, moderate traffic
+        let base = 1700000000.0_f64;
+        for i in 0..100u64 {
+            let epoch = base + i as f64 * 0.5;
+            let dst_port: i32 = if i % 3 == 0 { 443 } else if i % 3 == 1 { 80 } else { 53 };
+            let dns = if dst_port == 53 { Some("www.google.com") } else { None };
+            conn.execute(
+                "INSERT INTO packets (epoch, ip_src, ip_dst, tcp_dst_port, udp_dst_port, dns_query, frame_len) VALUES (?1,'192.168.1.50','10.0.0.1',?2,NULL,?3,1200)",
+                rusqlite::params![epoch, dst_port, dns],
+            ).unwrap();
+        }
+        // Add a few DNS queries to different domains
+        for (i, domain) in ["google.com", "github.com", "stackoverflow.com", "reddit.com", "youtube.com"].iter().enumerate() {
+            let epoch = base + 200.0 + i as f64;
+            conn.execute(
+                "INSERT INTO packets (epoch, ip_src, ip_dst, tcp_dst_port, udp_dst_port, dns_query, frame_len) VALUES (?1,'192.168.1.50','10.0.0.1',NULL,53,?2,64)",
+                rusqlite::params![epoch, domain],
+            ).unwrap();
+        }
+        // Register the device
+        conn.execute(
+            "INSERT INTO devices (ip, hostname, os_guess, ports) VALUES ('192.168.1.50', 'workstation1', 'Windows 10', '443,80')",
+            [],
+        ).unwrap();
+    }
+
+    fn build_c2_db(path: &std::path::Path) {
+        let conn = init_db(path);
+        // C2 beacon: regular 60s intervals to single external IP, low DNS
+        let base = 1700000000.0_f64;
+        for i in 0..30u64 {
+            let epoch = base + i as f64 * 60.0;
+            conn.execute(
+                "INSERT INTO packets (epoch, ip_src, ip_dst, tcp_dst_port, udp_dst_port, dns_query, frame_len) VALUES (?1,'192.168.1.100','185.100.87.42',443,NULL,NULL,200)",
+                rusqlite::params![epoch],
+            ).unwrap();
+        }
+        // Single DNS query
+        conn.execute(
+            "INSERT INTO packets (epoch, ip_src, ip_dst, udp_dst_port, dns_query, frame_len) VALUES (1699999900,'192.168.1.100','10.0.0.1',53,'evil.com',64)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO devices (ip, hostname, os_guess, ports) VALUES ('192.168.1.100', NULL, NULL, '')",
+            [],
+        ).unwrap();
+    }
+
+    fn build_scanner_db(path: &std::path::Path) {
+        let conn = init_db(path);
+        // Scanner: many dest IPs, many dest ports, low packets per dest
+        let base = 1700000000.0_f64;
+        for i in 0..40u64 {
+            let dst_ip = format!("192.168.1.{}", (i % 20) + 1);
+            let dst_port = 20 + (i % 30) as i32;
+            let epoch = base + i as f64 * 0.1;
+            conn.execute(
+                "INSERT INTO packets (epoch, ip_src, ip_dst, tcp_dst_port, udp_dst_port, frame_len) VALUES (?1,'192.168.1.200',?2,?3,NULL,64)",
+                rusqlite::params![epoch, dst_ip, dst_port],
+            ).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO devices (ip, hostname, os_guess, ports) VALUES ('192.168.1.200', 'suspect', NULL, '')",
+            [],
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_integration_clean_workstation() {
+        let dir = std::env::temp_dir().join("correlator_test_clean");
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("test.db");
+        build_clean_db(&db_path);
+
+        let ctx = build_network_context(&db_path, false);
+        // Should not have any high-confidence threat findings
+        let threats: Vec<_> = ctx.findings.iter()
+            .filter(|f| matches!(f.kind, FindingKind::C2Beacon | FindingKind::DataExfil | FindingKind::LateralMovement | FindingKind::Scanner))
+            .collect();
+        assert!(threats.is_empty(), "clean workstation should have no threat findings, got: {:?}", threats.iter().map(|f| f.kind.to_string()).collect::<Vec<_>>());
+
+        // Should have some findings (browser, server, etc.)
+        assert!(!ctx.findings.is_empty(), "clean workstation should have at least one finding");
+
+        // Behavioral summaries should exist
+        assert!(!ctx.behavioral_summaries.is_empty(), "should have behavioral summaries");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_integration_c2_beacon() {
+        let dir = std::env::temp_dir().join("correlator_test_c2");
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("test.db");
+        build_c2_db(&db_path);
+
+        let ctx = build_network_context(&db_path, false);
+        let c2_findings: Vec<_> = ctx.findings.iter()
+            .filter(|f| f.kind == FindingKind::C2Beacon)
+            .collect();
+        assert!(!c2_findings.is_empty(), "should detect C2 beacon pattern");
+        assert_eq!(c2_findings[0].ip, "192.168.1.100");
+        assert!(c2_findings[0].confidence > 0.3, "C2 confidence should be > 0.3, got {}", c2_findings[0].confidence);
+
+        // Verify the device summary mentions the C2
+        let summary = ctx.behavioral_summaries.iter().find(|s| s.ip == "192.168.1.100");
+        assert!(summary.is_some(), "should have behavioral summary for C2 IP");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_integration_scanner() {
+        let dir = std::env::temp_dir().join("correlator_test_scanner");
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("test.db");
+        build_scanner_db(&db_path);
+
+        let ctx = build_network_context(&db_path, false);
+        let scanner_findings: Vec<_> = ctx.findings.iter()
+            .filter(|f| f.kind == FindingKind::Scanner)
+            .collect();
+        assert!(!scanner_findings.is_empty(), "should detect scanner pattern");
+        assert_eq!(scanner_findings[0].ip, "192.168.1.200");
+        assert!(scanner_findings[0].confidence > 0.3, "scanner confidence should be > 0.3, got {}", scanner_findings[0].confidence);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_integration_corporate_mode_hides_consumer_findings() {
+        let dir = std::env::temp_dir().join("correlator_test_corporate");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("test.db");
+
+        let conn = init_db(&db_path);
+        let base = 1700000000.0_f64;
+
+        // UDP-dominant traffic (streaming)
+        for i in 0..500u64 {
+            let epoch = base + i as f64 * 0.08; // 40s total
+            if i % 5 == 0 {
+                conn.execute(
+                    "INSERT INTO packets (epoch, ip_src, ip_dst, tcp_dst_port, frame_len) VALUES (?1,'192.168.1.50','10.0.0.1',443,1200)",
+                    rusqlite::params![epoch],
+                ).unwrap();
+            } else {
+                conn.execute(
+                    "INSERT INTO packets (epoch, ip_src, ip_dst, udp_dst_port, frame_len) VALUES (?1,'192.168.1.50','10.0.0.1',1935,1200)",
+                    rusqlite::params![epoch],
+                ).unwrap();
+            }
+        }
+
+        // DNS queries for streaming domains (triggers CDN hit bonus)
+        for (i, domain) in ["netflix.com", "netflix.com", "hulu.com", "hulu.com", "hbomax.com"].iter().enumerate() {
+            let epoch = base + 100.0 + i as f64;
+            conn.execute(
+                "INSERT INTO packets (epoch, ip_src, ip_dst, udp_dst_port, dns_query, frame_len) VALUES (?1,'192.168.1.50','10.0.0.1',53,?2,64)",
+                rusqlite::params![epoch, domain],
+            ).unwrap();
+        }
+
+        conn.execute(
+            "INSERT INTO devices (ip, hostname, os_guess, ports) VALUES ('192.168.1.50', 'stream-pc', 'Windows 10', '443')",
+            [],
+        ).unwrap();
+        drop(conn);
+
+        let ctx_no_corp = build_network_context(&db_path, false);
+        let ctx_corp = build_network_context(&db_path, true);
+
+        let streaming_no_corp = ctx_no_corp.findings.iter().any(|f| f.kind == FindingKind::StreamingMedia);
+        let streaming_corp = ctx_corp.findings.iter().any(|f| f.kind == FindingKind::StreamingMedia);
+
+        assert!(streaming_no_corp, "streaming should fire without corporate mode, findings: {:?}",
+            ctx_no_corp.findings.iter().map(|f| format!("{}({:.2})", f.kind, f.confidence)).collect::<Vec<_>>());
+        assert!(!streaming_corp, "streaming should NOT fire with corporate mode");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
