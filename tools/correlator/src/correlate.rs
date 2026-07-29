@@ -1038,6 +1038,7 @@ fn is_private_ip(ip: &str) -> bool {
         10 => true,
         172 => octets[1] >= 16 && octets[1] <= 31,
         192 => octets[1] == 168,
+        169 => octets[1] == 254, // link-local
         _ => false,
     }
 }
@@ -2034,10 +2035,10 @@ impl fmt::Display for BehavioralSummary {
 }
 
 pub fn generate_behavioral_summaries(
-    correlator: &mut Correlator,
+    correlator: &Correlator,
     devices: &[(String, Option<String>, Option<String>, Option<String>, Option<String>, String)],
+    findings: &[Finding],
 ) -> Vec<BehavioralSummary> {
-    let findings = correlator.correlate_with_devices(devices);
     let mut summaries = Vec::new();
 
     for profile in correlator.profiles.values() {

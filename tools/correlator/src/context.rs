@@ -35,7 +35,7 @@ pub fn build_network_context(db_path: &Path) -> NetworkContext {
     correlator.ingest_batch(packets);
     let findings = correlator.correlate_with_devices(&devices);
     let cross_ref = correlator.cross_reference(&devices);
-    let behavioral_summaries = generate_behavioral_summaries(&mut correlator, &devices);
+    let behavioral_summaries = generate_behavioral_summaries(&correlator, &devices, &findings);
 
     eprintln!(" done ({} IPs, {} findings)", correlator.profiles().len(), findings.len());
 

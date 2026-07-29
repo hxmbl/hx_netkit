@@ -17,9 +17,9 @@ pub fn run_capture(interface: &str, target: &str, duration: u64, no_save: bool, 
     println!("═══════ CAPTURE ═══════");
     println!("[System] Database: {}", db_path.display());
     println!("[System] Stealth level: {} ({})", stealth_level, match stealth_level {
-        0 => "passive — TShark only, no scanning",
-        1 => "light — rate-limited scan",
-        _ => "full — standard scan",
+        0 => "full scan — aggressive nmap, background scanner active",
+        1 => "light — rate-limited scan, slower background scanner",
+        _ => "passive — TShark only, no active scanning",
     });
 
     let conn = init_db(&db_path);
@@ -37,7 +37,7 @@ pub fn run_capture(interface: &str, target: &str, duration: u64, no_save: bool, 
         None
     };
 
-    if !no_nmap && stealth_level > constants::STEALTH_PASSIVE {
+    if !no_nmap && stealth_level <= constants::STEALTH_LIGHT {
         println!("[System] Starting nmap scan of {}...", target);
         let mut args: Vec<&str> = constants::nmap_flags(stealth_level, fast).to_vec();
         args.push(target);

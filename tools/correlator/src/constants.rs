@@ -252,43 +252,49 @@ pub const EPHEMERAL_PORT_MIN: u32 = 49152;
 pub const MIN_BINS_FOR_BURST: usize = 3;
 
 // ══════════════════════════════════════════════════════════════
-// Stealth Levels
+// Stealth Levels (higher = more hidden)
 // ══════════════════════════════════════════════════════════════
 
-/// Level 0: Passive only — TShark capture, no active scanning.
-pub const STEALTH_PASSIVE: u8 = 0;
-/// Level 1: Light — rate-limited nmap, no OS detection, no background scanner.
+/// Level 0: Full scan — default, aggressive nmap, background scanner active.
+pub const STEALTH_FULL: u8 = 0;
+/// Level 1: Light — rate-limited nmap, slower background scanner.
 pub const STEALTH_LIGHT: u8 = 1;
-/// Level 2: Normal — current behavior (full nmap, background scanner).
-pub const STEALTH_FULL: u8 = 2;
+/// Level 2: Passive — TShark only, no active scanning at all.
+pub const STEALTH_PASSIVE: u8 = 2;
 
 /// Nmap timing template for each stealth level.
 pub const fn nmap_timing(stealth: u8) -> &'static str {
     match stealth {
-        0 => "-T1",
+        0 => "-T4",
         1 => "-T2",
-        _ => "-T4",
+        _ => "-T1",
     }
 }
 
 /// Whether to run the background scanner at this stealth level.
 pub const fn background_scanner_enabled(stealth: u8) -> bool {
-    stealth >= STEALTH_FULL
+    stealth < STEALTH_PASSIVE
 }
 
 /// Background scanner interval (seconds) per stealth level.
 pub const fn background_scanner_interval(stealth: u8) -> u64 {
     match stealth {
-        0 => 0, // disabled
+        0 => 4,
         1 => 30,
-        _ => 4,
+        _ => 0, // disabled
     }
 }
 
 /// Nmap flags for each stealth level.
 pub const fn nmap_flags(stealth: u8, fast: bool) -> &'static [&'static str] {
     match stealth {
-        0 => &[], // no scanning
+        0 => {
+            if fast {
+                &["-sS", "--top-ports", "100", "--open", "-oX", "-", "-T4", "--min-rate", "1000"]
+            } else {
+                &["-sV", "-O", "-sC", "--open", "-oX", "-", "-T4"]
+            }
+        }
         1 => {
             if fast {
                 &["-sn", "-T2", "--max-retries", "1", "--host-timeout", "10s"]
@@ -296,12 +302,6 @@ pub const fn nmap_flags(stealth: u8, fast: bool) -> &'static [&'static str] {
                 &["-sn", "-T2", "--max-retries", "2", "--host-timeout", "15s"]
             }
         }
-        _ => {
-            if fast {
-                &["-sS", "--top-ports", "100", "--open", "-oX", "-", "-T4", "--min-rate", "1000"]
-            } else {
-                &["-sV", "-O", "-sC", "--open", "-oX", "-", "-T4"]
-            }
-        }
+        _ => &[], // passive — no scanning
     }
 }

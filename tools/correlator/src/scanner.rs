@@ -477,16 +477,28 @@ pub fn start_scanner(
 }
 
 pub fn guess_os_from_ports(ports: &[u32]) -> String {
-    if ports.contains(&9100) || ports.contains(&631) {
+    let has = |p: u32| ports.contains(&p);
+
+    if has(9100) || has(631) {
         "printer/IoT".into()
-    } else if ports.contains(&554) || ports.contains(&1935) {
+    } else if has(554) || has(1935) {
         "camera/streaming".into()
-    } else if ports.contains(&22) && ports.contains(&443) && ports.contains(&80) {
+    } else if has(22) && has(443) && has(80) {
         "Linux server".into()
-    } else if ports.contains(&3389) {
+    } else if has(3389) || has(5985) || has(5986) {
         "Windows".into()
-    } else if ports.contains(&8443) && ports.contains(&500) {
+    } else if has(445) && (has(135) || has(139)) {
+        "Windows (SMB/RPC)".into()
+    } else if has(88) && has(3268) {
+        "Windows Domain Controller".into()
+    } else if has(8443) && has(500) {
         "VPN/firewall appliance".into()
+    } else if has(22) && has(443) {
+        "Linux/Unix server".into()
+    } else if has(22) {
+        "Linux/Unix (SSH)".into()
+    } else if has(443) || has(80) {
+        "web server".into()
     } else {
         format!("{} open port(s)", ports.len())
     }

@@ -74,8 +74,8 @@ enum Commands {
         no_tshark: bool,
         #[arg(long)]
         debug: bool,
-        /// Stealth level: 0=passive (TShark only), 1=light (rate-limited scan), 2=full (default)
-        #[arg(long, default_value_t = 2)]
+        /// Stealth level: 0=full scan (default), 1=light, 2=passive (no scanning)
+        #[arg(long, default_value_t = 0)]
         stealth_level: u8,
     },
 
@@ -85,8 +85,8 @@ enum Commands {
         db: Option<PathBuf>,
         #[arg(long)]
         model: Option<String>,
-        /// Stealth level: 0=passive, 1=light, 2=full (default)
-        #[arg(long, default_value_t = 2)]
+        /// Stealth level: 0=full (default), 1=light, 2=passive
+        #[arg(long, default_value_t = 0)]
         stealth_level: u8,
     },
 
