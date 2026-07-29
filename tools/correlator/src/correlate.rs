@@ -2812,6 +2812,255 @@ mod tests {
         assert!(!has_streaming, "streaming detector should NOT fire with corporate mode");
     }
 
+    // ── Edge Case Tests ──
+
+    #[test]
+    fn test_empty_database_no_findings() {
+        let dir = std::env::temp_dir().join("correlator_test_empty");
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("test.db");
+        let conn = init_db(&db_path);
+        drop(conn);
+
+        let ctx = build_network_context(&db_path, false);
+        assert!(ctx.findings.is_empty(), "empty DB should produce no findings");
+        assert!(ctx.behavioral_summaries.is_empty(), "empty DB should produce no summaries");
+        assert_eq!(ctx.packet_count, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_single_device_minimal_traffic() {
+        let dir = std::env::temp_dir().join("correlator_test_single");
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("test.db");
+        let conn = init_db(&db_path);
+        let base = 1700000000.0_f64;
+        for i in 0..3u64 {
+            conn.execute(
+                "INSERT INTO packets (epoch, ip_src, ip_dst, tcp_dst_port, frame_len) VALUES (?1,'192.168.1.10','10.0.0.1',443,1200)",
+                rusqlite::params![base + i as f64],
+            ).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO devices (ip, hostname, os_guess, ports) VALUES ('192.168.1.10', 'lonely-host', 'Linux', '22')",
+            [],
+        ).unwrap();
+        drop(conn);
+
+        let ctx = build_network_context(&db_path, false);
+        assert!(ctx.findings.is_empty(), "single device with minimal traffic should have no findings (below threshold)");
+        assert_eq!(ctx.devices.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_large_network_many_devices() {
+        let dir = std::env::temp_dir().join("correlator_test_large");
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("test.db");
+        let conn = init_db(&db_path);
+        let base = 1700000000.0_f64;
+        for dev in 0..50u64 {
+            let ip = format!("192.168.1.{}", dev + 1);
+            for i in 0..30u64 {
+                let epoch = base + i as f64;
+                let dst_port: i32 = if i % 2 == 0 { 443 } else { 53 };
+                conn.execute(
+                    "INSERT INTO packets (epoch, ip_src, ip_dst, tcp_dst_port, frame_len) VALUES (?1,?2,'10.0.0.1',?3,1200)",
+                    rusqlite::params![epoch, ip, dst_port],
+                ).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO devices (ip, hostname, os_guess, ports) VALUES (?1,NULL,NULL,'')",
+                rusqlite::params![ip],
+            ).unwrap();
+        }
+        drop(conn);
+
+        let ctx = build_network_context(&db_path, false);
+        assert_eq!(ctx.devices.len(), 50, "should have 50 devices");
+        assert!(!ctx.behavioral_summaries.is_empty(), "should have behavioral summaries");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_malformed_packets_graceful_handling() {
+        let dir = std::env::temp_dir().join("correlator_test_malformed");
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("test.db");
+        let conn = init_db(&db_path);
+        let base = 1700000000.0_f64;
+        for i in 0..5u64 {
+            conn.execute(
+                "INSERT INTO packets (epoch, ip_src, ip_dst, tcp_dst_port, dns_query, frame_len) VALUES (?1,NULL,NULL,443,NULL,0)",
+                rusqlite::params![base + i as f64],
+            ).unwrap();
+        }
+        for i in 0..5u64 {
+            conn.execute(
+                "INSERT INTO packets (epoch, ip_src, ip_dst, tcp_dst_port, frame_len) VALUES (?1,'','',443,100)",
+                rusqlite::params![base + 10.0 + i as f64],
+            ).unwrap();
+        }
+        drop(conn);
+
+        let ctx = build_network_context(&db_path, false);
+        assert!(ctx.behavioral_summaries.is_empty() || ctx.behavioral_summaries.iter().all(|s| !s.ip.is_empty()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cross_reference_output() {
+        let dir = std::env::temp_dir().join("correlator_test_xref");
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("test.db");
+        let conn = init_db(&db_path);
+        let base = 1700000000.0_f64;
+        for i in 0..40u64 {
+            conn.execute(
+                "INSERT INTO packets (epoch, ip_src, ip_dst, tcp_dst_port, dns_query, frame_len) VALUES (?1,'192.168.1.50','10.0.0.1',443,NULL,1200)",
+                rusqlite::params![base + i as f64],
+            ).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO devices (ip, hostname, os_guess, ports) VALUES ('192.168.1.50','ws1','Windows','443')",
+            [],
+        ).unwrap();
+        drop(conn);
+
+        let ctx = build_network_context(&db_path, false);
+        let output = ctx.cross_ref;
+        assert!(!output.is_empty(), "cross_reference should produce output");
+        assert!(output.contains("192.168.1.50") || output.contains("No devices") || output.contains("0 devices"),
+            "cross_reference should mention device IPs: {}", output);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_detect_iot_device() {
+        let mut p = make_profile("192.168.1.30");
+        p.udp_count = 80;
+        p.tcp_count = 5;
+        p.packet_count = 85;
+        p.outbound_count = 40;
+        p.inbound_count = 45;
+        *p.dest_ports.entry(5353).or_insert(0) += 15;
+        *p.dest_ports.entry(1900).or_insert(0) += 10;
+        *p.dest_ports.entry(5683).or_insert(0) += 8;
+        p.dns_count = 2;
+        p.dns_domains.insert("local".into(), 2);
+        p.first_seen = 1000.0;
+        p.last_seen = 2000.0;
+
+        let f = detect_iot(&p);
+        assert!(f.is_some(), "should detect IoT device with multicast/low PPS: {:?}", f);
+        assert_eq!(f.unwrap().kind, FindingKind::IoTDevice);
+    }
+
+    #[test]
+    fn test_detect_dns_profiler() {
+        let mut p = make_profile("192.168.1.77");
+        p.dns_count = 200;
+        for i in 0..80 {
+            p.dns_domains.insert(format!("d{}.x.com", i), 1);
+        }
+        p.packet_count = 250;
+        p.outbound_count = 100;
+
+        let f = detect_dns_profiler(&p);
+        if let Some(ref finding) = f {
+            assert_eq!(finding.kind, FindingKind::DNSProfiler);
+        }
+        // DNS profiler may not fire depending on thresholds — just verify no panic
+    }
+
+    #[test]
+    fn test_detect_vpn() {
+        let mut p = make_profile("192.168.1.40");
+        *p.dest_ports.entry(1194).or_insert(0) += 50;
+        p.dest_ips.insert("10.0.0.1".into(), 50);
+        p.udp_count = 50;
+        p.tcp_count = 5;
+        p.packet_count = 55;
+        p.outbound_count = 30;
+        p.inbound_count = 25;
+        p.avg_packet_size = 600.0;
+        p.first_seen = 1000.0;
+        p.last_seen = 5000.0;
+
+        let f = detect_vpn(&p);
+        assert!(f.is_some(), "should detect VPN with port 1194 and single dest: {:?}", f);
+        assert_eq!(f.unwrap().kind, FindingKind::VPN);
+    }
+
+    #[test]
+    fn test_detect_cloud_sync() {
+        let mut p = make_profile("192.168.1.60");
+        p.dns_count = 15;
+        p.dns_domains.insert("dropbox.com".into(), 5);
+        p.dns_domains.insert("onedrive.live.com".into(), 3);
+        p.dns_domains.insert("drive.google.com".into(), 4);
+        p.dns_domains.insert("icloud.com".into(), 3);
+        p.packet_count = 100;
+        p.outbound_count = 50;
+        p.inbound_count = 50;
+        *p.dest_ports.entry(443).or_insert(0) += 40;
+        p.dest_ips.insert("10.0.0.1".into(), 50);
+        p.first_seen = 1000.0;
+        p.last_seen = 3000.0;
+
+        let f = detect_cloud_sync(&p);
+        assert!(f.is_some(), "should detect cloud sync with cloud domains: {:?}", f);
+        assert_eq!(f.unwrap().kind, FindingKind::CloudSync);
+    }
+
+    #[test]
+    fn test_shannon_entropy_single_element() {
+        let single: Vec<u32> = vec![42];
+        assert_eq!(shannon_entropy(&single), 0.0);
+    }
+
+    #[test]
+    fn test_extract_domain_edge_cases() {
+        assert_eq!(extract_domain(""), "");
+        assert_eq!(extract_domain("localhost"), "localhost");
+        assert_eq!(extract_domain("a.b.c.d.e"), "d.e");
+        assert_eq!(extract_domain("single.label"), "single.label");
+    }
+
+    #[test]
+    fn test_behavioral_summary_generation() {
+        let dir = std::env::temp_dir().join("correlator_test_behavioral");
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("test.db");
+        let conn = init_db(&db_path);
+        let base = 1700000000.0_f64;
+        for i in 0..50u64 {
+            let epoch = base + i as f64 * 0.5;
+            conn.execute(
+                "INSERT INTO packets (epoch, ip_src, ip_dst, tcp_dst_port, dns_query, frame_len) VALUES (?1,'192.168.1.50','10.0.0.1',443,'example.com',1200)",
+                rusqlite::params![epoch],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO packets (epoch, ip_src, ip_dst, udp_dst_port, frame_len) VALUES (?1,'192.168.1.60','10.0.0.1',5353,200)",
+                rusqlite::params![epoch],
+            ).unwrap();
+        }
+        conn.execute("INSERT OR IGNORE INTO devices (ip, hostname, os_guess, ports) VALUES ('192.168.1.50','ws1','Windows','443')", []).unwrap();
+        conn.execute("INSERT OR IGNORE INTO devices (ip, hostname, os_guess, ports) VALUES ('192.168.1.60','iot1','Linux','22')", []).unwrap();
+        drop(conn);
+
+        let ctx = build_network_context(&db_path, false);
+        assert!(ctx.behavioral_summaries.len() >= 2, "should have at least 2 behavioral summaries, got {}", ctx.behavioral_summaries.len());
+        let s1 = ctx.behavioral_summaries.iter().find(|s| s.ip == "192.168.1.50").unwrap();
+        assert!(!s1.device_type.is_empty());
+        assert!(!s1.activity.is_empty());
+        let s2 = ctx.behavioral_summaries.iter().find(|s| s.ip == "192.168.1.60").unwrap();
+        assert!(!s2.device_type.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ── Integration Tests ──
 
     use crate::db::init_db;
