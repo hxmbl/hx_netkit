@@ -32,7 +32,7 @@ pub fn run_chat(db_path: &Path, model: &str, live_mode: bool, stealth_level: u8)
     }
 
     println!("[System] Building context from {}", db_path.display());
-    let ctx = build_network_context(db_path);
+    let ctx = build_network_context(db_path, config.corporate_mode);
     let context_str = format_context_for_ai(&ctx);
 
     let beliefs = Arc::new(Mutex::new(BeliefSystem::new()));

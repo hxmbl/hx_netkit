@@ -165,7 +165,10 @@ enum Commands {
 
 fn run_query(db_path: &std::path::Path, sql: &str, format: &str) {
     let conn = db::open_db(db_path);
-    let mut stmt = conn.prepare(sql).expect("Invalid SQL");
+    let mut stmt = match conn.prepare(sql) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("[Error] Invalid SQL: {}", e); return; }
+    };
     let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
 
     if format == "csv" {
@@ -175,9 +178,12 @@ fn run_query(db_path: &std::path::Path, sql: &str, format: &str) {
         println!("{}", "-".repeat(60));
     }
 
-    let mut rows = stmt.query([]).expect("Query failed");
+    let mut rows = match stmt.query([]) {
+        Ok(r) => r,
+        Err(e) => { eprintln!("[Error] Query failed: {}", e); return; }
+    };
     let mut count = 0;
-    while let Some(row) = rows.next().unwrap() {
+    while let Some(row) = rows.next().unwrap_or(None) {
         let values: Vec<String> = (0..cols.len()).map(|i| {
             row.get::<_, String>(i).unwrap_or_else(|_| "NULL".into())
         }).collect();
@@ -275,8 +281,8 @@ fn run_list() {
     }
 }
 
-fn run_ask(db_path: &std::path::Path, question: &str, model: &str) {
-    let ctx = context::build_network_context(db_path);
+fn run_ask(db_path: &std::path::Path, question: &str, model: &str, corporate_mode: bool) {
+    let ctx = context::build_network_context(db_path, corporate_mode);
     let context_str = context::format_context_for_ai(&ctx);
     let ollama = OllamaClient::new(model);
     if !ollama.is_available() {
@@ -290,8 +296,8 @@ fn run_ask(db_path: &std::path::Path, question: &str, model: &str) {
     }
 }
 
-fn run_report(db_path: &std::path::Path, model: &str) {
-    let ctx = context::build_network_context(db_path);
+fn run_report(db_path: &std::path::Path, model: &str, corporate_mode: bool) {
+    let ctx = context::build_network_context(db_path, corporate_mode);
     let ollama = OllamaClient::new(model);
     if !ollama.is_available() {
         eprintln!("[Error] Ollama not available");
@@ -338,7 +344,7 @@ fn main() {
         Commands::Chat { db, model, stealth_level } => {
             let db_path = db.unwrap_or_else(|| {
                 let dir = config::dirs();
-                let mut entries: Vec<_> = std::fs::read_dir(&dir).unwrap()
+                let mut entries: Vec<_> = std::fs::read_dir(&dir).unwrap_or_else(|_| std::fs::read_dir(".").unwrap())
                     .filter_map(|e| e.ok())
                     .filter(|e| e.path().extension().map(|ext| ext == "db").unwrap_or(false))
                     .collect();
@@ -361,23 +367,27 @@ fn main() {
                 print!("Target CIDR (e.g. 192.168.1.0/24): ");
                 io::stdout().flush().ok();
                 let mut input = String::new();
-                io::stdin().read_line(&mut input).unwrap();
+                let _ = io::stdin().read_line(&mut input);
                 input.trim().to_string()
             });
             let db_path = db::default_db_path(false, output.as_deref());
             let conn = db::init_db(&db_path);
             let args = vec!["-sV", "-O", "-sC", "--open", "-oX", "-", "-T4", &tgt];
-            let output = tools::sudo_cmd("nmap").args(&args)
+            match tools::sudo_cmd("nmap").args(&args)
                 .stdin(std::process::Stdio::inherit())
-                .output().expect("Failed to run nmap");
-            let xml_str = String::from_utf8_lossy(&output.stdout);
-            if !xml_str.is_empty() {
-                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64();
-                let summary = context::parse_nmap_xml(&xml_str, &conn, now);
-                conn.execute("INSERT INTO nmap_scans (target, scan_time, raw_xml, summary) VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![tgt, now, xml_str.to_string(), summary.clone()]).unwrap();
-                println!("{}", summary);
-            }
+                .output() {
+                    Ok(output) => {
+                        let xml_str = String::from_utf8_lossy(&output.stdout);
+                        if !xml_str.is_empty() {
+                            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+                            let summary = context::parse_nmap_xml(&xml_str, &conn, now);
+                            let _ = conn.execute("INSERT INTO nmap_scans (target, scan_time, raw_xml, summary) VALUES (?1, ?2, ?3, ?4)",
+                                rusqlite::params![tgt, now, xml_str.to_string(), summary.clone()]);
+                            println!("{}", summary);
+                        }
+                    }
+                    Err(e) => eprintln!("[Error] Failed to run nmap: {}. Is it installed?", e),
+                }
             println!("[System] Saved to {}", db_path.display());
         }
         Commands::Query { sql, db } => run_query(&db, &sql, "table"),
@@ -386,8 +396,8 @@ fn main() {
         Commands::TopTalkers { db, limit } => run_top_talkers(&db, limit),
         Commands::Devices { db } => run_devices(&db),
         Commands::List => run_list(),
-        Commands::Report { db, model } => run_report(&db, resolve_model(model.as_deref(), &config)),
-        Commands::Ask { db, question, model } => run_ask(&db, &question, resolve_model(model.as_deref(), &config)),
+        Commands::Report { db, model } => run_report(&db, resolve_model(model.as_deref(), &config), config.corporate_mode),
+        Commands::Ask { db, question, model } => run_ask(&db, &question, resolve_model(model.as_deref(), &config), config.corporate_mode),
         Commands::Search { db, query } => search::run_search(&db, query.as_deref()),
     }
 }

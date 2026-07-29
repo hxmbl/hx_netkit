@@ -19,6 +19,9 @@ pub struct Config {
     /// Ollama context window (tokens). Default 12288 — keep ≤16384 on 8GB RAM.
     #[serde(default = "default_num_ctx")]
     pub num_ctx: u32,
+    /// Disable consumer-focused detectors (game, streaming, cloud_sync) in enterprise environments.
+    #[serde(default)]
+    pub corporate_mode: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::correlate::{Finding, FindingKind};
 use crate::tools::sudo_cmd;
@@ -417,15 +418,25 @@ pub fn start_scanner(
     tx: mpsc::Sender<ScannerEvent>,
     _interface: String,
     stealth_level: u8,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
+) -> ScannerHandle {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = stop.clone();
+
+    let handle = std::thread::spawn(move || {
         use crate::constants;
         if !constants::background_scanner_enabled(stealth_level) {
             return;
         }
         let interval = std::time::Duration::from_secs(constants::background_scanner_interval(stealth_level));
         loop {
+            if stop_clone.load(Ordering::Relaxed) {
+                break;
+            }
             std::thread::sleep(interval);
+
+            if stop_clone.load(Ordering::Relaxed) {
+                break;
+            }
 
             let target = {
                 let sys = beliefs.lock().unwrap();
@@ -473,7 +484,26 @@ pub fn start_scanner(
                 }
             }
         }
-    })
+    });
+
+    ScannerHandle { stop, _handle: handle }
+}
+
+pub struct ScannerHandle {
+    stop: Arc<AtomicBool>,
+    _handle: std::thread::JoinHandle<()>,
+}
+
+impl ScannerHandle {
+    pub fn shutdown(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Drop for ScannerHandle {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }
 
 pub fn guess_os_from_ports(ports: &[u32]) -> String {
@@ -501,5 +531,83 @@ pub fn guess_os_from_ports(ports: &[u32]) -> String {
         "web server".into()
     } else {
         format!("{} open port(s)", ports.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_guess_os_printer() {
+        assert_eq!(guess_os_from_ports(&[9100, 80]), "printer/IoT");
+        assert_eq!(guess_os_from_ports(&[631]), "printer/IoT");
+    }
+
+    #[test]
+    fn test_guess_os_camera() {
+        assert_eq!(guess_os_from_ports(&[554, 80]), "camera/streaming");
+        assert_eq!(guess_os_from_ports(&[1935]), "camera/streaming");
+    }
+
+    #[test]
+    fn test_guess_os_linux_server() {
+        assert_eq!(guess_os_from_ports(&[22, 80, 443]), "Linux server");
+    }
+
+    #[test]
+    fn test_guess_os_windows() {
+        assert_eq!(guess_os_from_ports(&[3389, 445]), "Windows");
+        assert_eq!(guess_os_from_ports(&[5985]), "Windows");
+        assert_eq!(guess_os_from_ports(&[5986]), "Windows");
+    }
+
+    #[test]
+    fn test_guess_os_windows_smb() {
+        assert_eq!(guess_os_from_ports(&[445, 135]), "Windows (SMB/RPC)");
+        assert_eq!(guess_os_from_ports(&[445, 139]), "Windows (SMB/RPC)");
+    }
+
+    #[test]
+    fn test_guess_os_domain_controller() {
+        assert_eq!(guess_os_from_ports(&[88, 3268, 445]), "Windows Domain Controller");
+    }
+
+    #[test]
+    fn test_guess_os_vpn_firewall() {
+        assert_eq!(guess_os_from_ports(&[8443, 500]), "VPN/firewall appliance");
+    }
+
+    #[test]
+    fn test_guess_os_linux_server_only() {
+        assert_eq!(guess_os_from_ports(&[22, 443]), "Linux/Unix server");
+    }
+
+    #[test]
+    fn test_guess_os_linux_ssh() {
+        assert_eq!(guess_os_from_ports(&[22]), "Linux/Unix (SSH)");
+    }
+
+    #[test]
+    fn test_guess_os_web_server() {
+        assert_eq!(guess_os_from_ports(&[443]), "web server");
+        assert_eq!(guess_os_from_ports(&[80]), "web server");
+    }
+
+    #[test]
+    fn test_guess_os_unknown() {
+        let result = guess_os_from_ports(&[9999, 8888]);
+        assert!(result.contains("2 open port(s)"), "should fallback to port count: {}", result);
+    }
+
+    #[test]
+    fn test_guess_os_priority_printer_over_linux() {
+        // Printer should take priority over Linux server
+        assert_eq!(guess_os_from_ports(&[9100, 22, 80, 443]), "printer/IoT");
+    }
+
+    #[test]
+    fn test_guess_os_empty() {
+        assert_eq!(guess_os_from_ports(&[]), "0 open port(s)");
     }
 }

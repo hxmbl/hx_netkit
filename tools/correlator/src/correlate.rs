@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::time::{Duration, Instant};
 
@@ -1362,10 +1362,10 @@ impl Correlator {
     }
 
     pub fn correlate(&mut self) -> Vec<Finding> {
-        self.correlate_with_devices(&[])
+        self.correlate_with_devices(&[], false)
     }
 
-    pub fn correlate_with_devices(&mut self, devices: &[(String, Option<String>, Option<String>, Option<String>, Option<String>, String)]) -> Vec<Finding> {
+    pub fn correlate_with_devices(&mut self, devices: &[(String, Option<String>, Option<String>, Option<String>, Option<String>, String)], corporate_mode: bool) -> Vec<Finding> {
         self.finalize();
         let mut findings = Vec::new();
         let all_profiles = self.profiles.clone();
@@ -1374,7 +1374,7 @@ impl Correlator {
             if profile.packet_count < MIN_PACKETS_FOR_DETECTION { continue; }
 
             let mut ip_findings = Vec::new();
-            let detectors: Vec<Box<dyn Fn(&IpProfile) -> Option<Finding>>> = vec![
+            let mut detectors: Vec<Box<dyn Fn(&IpProfile) -> Option<Finding>>> = vec![
                 Box::new(detect_browser),
                 Box::new(detect_bot),
                 Box::new(detect_server),
@@ -1382,12 +1382,14 @@ impl Correlator {
                 Box::new(detect_dns_profiler),
                 Box::new(detect_beacon),
                 Box::new(detect_scanner),
-                Box::new(detect_streaming),
-                Box::new(detect_cloud_sync),
                 Box::new(detect_vpn),
                 Box::new(detect_tor),
-                Box::new(detect_game),
             ];
+            if !corporate_mode {
+                detectors.push(Box::new(detect_streaming));
+                detectors.push(Box::new(detect_cloud_sync));
+                detectors.push(Box::new(detect_game));
+            }
 
             for detector in &detectors {
                 if let Some(f) = detector(profile) {
@@ -1468,9 +1470,9 @@ impl Correlator {
 
                 lines.push(format!(
                     "Device at {} ({}, {}, {}) — {} packets over {:.1}s ({:.1} pps), {} out / {} in, {} TCP, {} UDP\n\
-                     ️  DNS: {} domains [{}]\n\
-                     ️  Dest ports: [{}]\n\
-                     ️  Top sources: [{}]",
+                      ️  DNS: {} domains [{}]\n\
+                      ️  Dest ports: [{}]\n\
+                      ️  Top sources: [{}]",
                     ip, hostname_str, os_str, vendor_str,
                     profile.packet_count, duration, pps, profile.outbound_count, profile.inbound_count,
                     profile.tcp_count, profile.udp_count,
@@ -1479,6 +1481,42 @@ impl Correlator {
                     top_ports.join(", "),
                     top_srcs.join(", "),
                 ));
+
+                // Packet evidence: sample packets for this IP
+                let samples: Vec<&Packet> = self.packets.iter()
+                    .filter(|p| p.ip_src.as_deref() == Some(ip) || p.ip_dst.as_deref() == Some(ip))
+                    .take(5)
+                    .collect();
+                if !samples.is_empty() {
+                    let pkt_lines: Vec<String> = samples.iter().map(|p| {
+                        let src = p.ip_src.as_deref().unwrap_or("?");
+                        let dst = p.ip_dst.as_deref().unwrap_or("?");
+                        let port = p.tcp_dst_port.or(p.udp_dst_port).unwrap_or(0);
+                        let proto = if p.tcp_dst_port.is_some() || p.tcp_src_port.is_some() { "TCP" }
+                            else if p.udp_dst_port.is_some() || p.udp_src_port.is_some() { "UDP" }
+                            else { "?" };
+                        let dns = p.dns_query.as_deref().map(|d| format!(" dns={}", d)).unwrap_or_default();
+                        format!("    {} → {}:{}/{}{}", src, dst, port, proto, dns)
+                    }).collect();
+                    lines.push(format!("  Packet evidence:\n{}", pkt_lines.join("\n")));
+                }
+
+                // Top peer connections with packet counts
+                let mut dests: Vec<_> = profile.dest_ips.iter().collect();
+                dests.sort_by(|a, b| b.1.cmp(a.1));
+                let peer_evidence: Vec<String> = dests.iter().take(3).map(|(peer, count)| {
+                    let peer_ports: Vec<String> = self.packets.iter()
+                        .filter(|p| p.ip_src.as_deref() == Some(ip) && p.ip_dst.as_deref() == Some(peer.as_str()))
+                        .filter_map(|p| p.tcp_dst_port.or(p.udp_dst_port))
+                        .collect::<HashSet<_>>()
+                        .into_iter()
+                        .map(|p| p.to_string())
+                        .collect();
+                    format!("    {} ({} pkts, ports: {})", peer, count, peer_ports.join(", "))
+                }).collect();
+                if !peer_evidence.is_empty() {
+                    lines.push(format!("  Top connections:\n{}", peer_evidence.join("\n")));
+                }
 
                 let open_tcp: Vec<_> = profile.src_ports.keys()
         .filter(|p| **p < PRIVILEGED_PORT_MAX as u32)
@@ -2515,5 +2553,262 @@ pub fn print_profile(profile: &IpProfile) {
         for (port, count) in ports.iter().take(8) {
             println!("    {:>5}x  port {}", count, port);
         }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+// Tests
+// ══════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_profile(ip: &str) -> IpProfile {
+        let mut p = IpProfile::new(ip);
+        p.first_seen = 1000.0;
+        p.last_seen = 2000.0;
+        p.packet_count = 50;
+        p.outbound_count = 30;
+        p.inbound_count = 20;
+        p
+    }
+
+    #[test]
+    fn test_is_private_ip() {
+        assert!(is_private_ip("10.0.0.1"));
+        assert!(is_private_ip("10.255.255.255"));
+        assert!(is_private_ip("172.16.0.1"));
+        assert!(is_private_ip("172.31.255.255"));
+        assert!(is_private_ip("192.168.1.1"));
+        assert!(is_private_ip("192.168.0.0"));
+        assert!(is_private_ip("169.254.1.1")); // link-local
+
+        assert!(!is_private_ip("8.8.8.8"));
+        assert!(!is_private_ip("172.32.0.1"));
+        assert!(!is_private_ip("172.15.0.1"));
+        assert!(!is_private_ip("192.169.0.1"));
+        assert!(!is_private_ip("1.1.1.1"));
+        assert!(!is_private_ip("not-an-ip"));
+        assert!(!is_private_ip("10.0.1")); // too few octets
+    }
+
+    #[test]
+    fn test_extract_domain() {
+        assert_eq!(extract_domain("www.google.com"), "google.com");
+        assert_eq!(extract_domain("cdn.assets.example.com"), "example.com");
+        assert_eq!(extract_domain("single"), "single");
+        assert_eq!(extract_domain("a.b"), "a.b");
+    }
+
+    #[test]
+    fn test_shannon_entropy() {
+        let uniform: Vec<u32> = (0..10).collect();
+        let e = shannon_entropy(&uniform);
+        assert!(e > 3.0, "uniform distribution should have high entropy, got {}", e);
+
+        let single: Vec<u32> = vec![5; 10];
+        let e2 = shannon_entropy(&single);
+        assert!(e2 < 0.1, "single-value distribution should have near-zero entropy, got {}", e2);
+
+        let empty: Vec<u32> = vec![];
+        assert_eq!(shannon_entropy(&empty), 0.0);
+    }
+
+    #[test]
+    fn test_detect_browser() {
+        let mut p = make_profile("192.168.1.50");
+        // Browser: many external domains, HTTPS, web-like ports, diverse dest IPs
+        for i in 0..25 {
+            p.dns_domains.insert(format!("site{}.example.com", i), 2);
+        }
+        p.dns_domains.insert("google.com".into(), 10);
+        p.dns_domains.insert("youtube.com".into(), 5);
+        p.dns_domains.insert("facebook.com".into(), 3);
+        p.dns_count = 30;
+        *p.dest_ports.entry(443).or_insert(0) += 20;
+        *p.dest_ports.entry(80).or_insert(0) += 10;
+        for i in 0..15 {
+            p.src_ports.insert(49152 + i, 1);
+        }
+        for i in 0..12 {
+            p.dest_ips.insert(format!("10.0.0.{}", i + 1), 2);
+        }
+        p.dest_port_entropy = 3.0;
+
+        let f = detect_browser(&p);
+        assert!(f.is_some(), "should detect browser with web domains");
+        assert_eq!(f.unwrap().kind, FindingKind::Browser);
+    }
+
+    #[test]
+    fn test_detect_bot() {
+        let mut p = make_profile("192.168.1.99");
+        // Bot: high rate, few unique domains, uniform intervals
+        p.packet_count = 500;
+        p.outbound_count = 45;
+        p.dns_domains.insert("api.evil.com".into(), 50);
+        p.dns_count = 50;
+        // 61 timestamps at 1.0s spacing → 60 intervals of 1.0s → CV=0, mean=1.0
+        // This triggers BOT_PRECISION (CV<0.1, mean>0.5) and autocorr >0.7
+        p.inter_arrival_times = (0..61).map(|i| 1000.0 + i as f64).collect();
+        p.burst_score = 0.1;
+        // 95% of traffic to port 443, >30 packets
+        *p.dest_ports.entry(443).or_insert(0) += 475;
+
+        let f = detect_bot(&p);
+        assert!(f.is_some(), "should detect bot with uniform traffic");
+        assert_eq!(f.unwrap().kind, FindingKind::Bot);
+    }
+
+    #[test]
+    fn test_detect_server() {
+        let mut p = make_profile("192.168.1.10");
+        // Server: many inbound connections, listening on well-known ports
+        p.inbound_count = 80;
+        p.outbound_count = 10;
+        *p.src_ports.entry(443).or_insert(0) += 30;
+        *p.src_ports.entry(80).or_insert(0) += 20;
+        for i in 0..10 {
+            p.src_ips.insert(format!("192.168.1.{}", i + 20), 5);
+        }
+
+        let f = detect_server(&p);
+        assert!(f.is_some(), "should detect server with many inbound connections");
+        assert_eq!(f.unwrap().kind, FindingKind::Server);
+    }
+
+    #[test]
+    fn test_detect_scanner() {
+        let mut p = make_profile("192.168.1.50");
+        // Scanner: many dest IPs, many dest ports, low packets per dest
+        for i in 0..20 {
+            p.dest_ips.insert(format!("192.168.1.{}", i + 1), 1);
+        }
+        for port in 20..40 {
+            p.dest_ports.insert(port, 1);
+        }
+        p.outbound_count = 30;
+
+        let f = detect_scanner(&p);
+        assert!(f.is_some(), "should detect scanner with many dest IPs and ports");
+        assert_eq!(f.unwrap().kind, FindingKind::Scanner);
+    }
+
+    #[test]
+    fn test_detect_c2_beacon() {
+        let mut p = make_profile("192.168.1.50");
+        // C2: regular intervals to single external IP
+        // inter_arrival_times stores raw timestamps; code diffs them to get intervals
+        // 31 timestamps at 60s spacing → 30 intervals of 60.0s → CV=0, mean=60.0
+        // This triggers C2_REGULAR (CV<0.15, mean>5.0)
+        p.inter_arrival_times = (0..31).map(|i| 1000.0 + i as f64 * 60.0).collect();
+        p.dest_ips.insert("185.100.87.42".into(), 1);
+        p.dns_count = 3;
+        p.outbound_count = 7; // avg_out = 7.0/1 = 7.0 < 8.0
+        p.dns_domains.insert("evil.com".into(), 1);
+        *p.dest_ports.entry(443).or_insert(0) += 7;
+        p.sessions.insert(
+            ("192.168.1.50".into(), 49152, "185.100.87.42".into(), 443),
+            TcpSession { pkt_count: 7, bytes_approx: 3500, ..Default::default() },
+        );
+
+        let f = detect_c2_beacon(&p);
+        assert!(f.is_some(), "should detect C2 beacon with regular intervals");
+        assert_eq!(f.unwrap().kind, FindingKind::C2Beacon);
+    }
+
+    #[test]
+    fn test_detect_data_exfil() {
+        let mut p = make_profile("192.168.1.50");
+        // Exfil: heavy outbound to single external IP
+        p.dest_ips.insert("203.0.113.50".into(), 1);
+        p.outbound_count = 200;
+        p.inbound_count = 10;
+        p.outbound_bytes = 50_000_000; // 50 MB
+        p.inbound_bytes = 100_000;
+        p.sessions.insert(
+            ("192.168.1.50".into(), 49152, "203.0.113.50".into(), 443),
+            TcpSession { pkt_count: 200, bytes_approx: 50_000_000, ..Default::default() },
+        );
+
+        let f = detect_data_exfil(&p);
+        assert!(f.is_some(), "should detect exfil with heavy outbound to single IP");
+        assert_eq!(f.unwrap().kind, FindingKind::DataExfil);
+    }
+
+    #[test]
+    fn test_detect_lateral_movement() {
+        let mut p = make_profile("192.168.1.50");
+        // Lateral: talking to many internal hosts
+        for i in 0..10 {
+            p.dest_ips.insert(format!("192.168.1.{}", i + 1), 3);
+        }
+        p.outbound_count = 40;
+
+        let mut all = HashMap::new();
+        all.insert("192.168.1.50".into(), p.clone());
+
+        let f = detect_lateral_movement(&p, &all);
+        assert!(f.is_some(), "should detect lateral movement to many internal hosts");
+        assert_eq!(f.unwrap().kind, FindingKind::LateralMovement);
+    }
+
+    #[test]
+    fn test_no_finding_for_clean_profile() {
+        let p = make_profile("192.168.1.50");
+        assert!(detect_browser(&p).is_none());
+        assert!(detect_bot(&p).is_none());
+        assert!(detect_scanner(&p).is_none());
+        assert!(detect_c2_beacon(&p).is_none());
+        assert!(detect_data_exfil(&p).is_none());
+    }
+
+    #[test]
+    fn test_classify_device_type() {
+        let p = make_profile("192.168.1.10");
+
+        let browser = Finding { ip: "192.168.1.10".into(), kind: FindingKind::Browser, confidence: 0.8, detail: String::new(), indicators: vec![] };
+        let findings = vec![&browser];
+        let device = classify_device_type(&p, &findings, None, None, Some("Windows 10"));
+        assert!(device.contains("workstation"), "browser should classify as workstation: {}", device);
+
+        let server = Finding { ip: "192.168.1.10".into(), kind: FindingKind::Server, confidence: 0.9, detail: String::new(), indicators: vec![] };
+        let findings = vec![&server];
+        let device = classify_device_type(&p, &findings, Some("web01"), None, None);
+        assert!(device.contains("Server"), "server finding should classify as Server: {}", device);
+    }
+
+    #[test]
+    fn test_correlate_with_devices_corporate_mode() {
+        let devices = vec![("192.168.1.50".into(), None, None, None, None, String::new())];
+
+        let make_corr = || {
+            let mut corr = Correlator::new();
+            let mut p = IpProfile::new("192.168.1.50");
+            p.first_seen = 1000.0;
+            p.last_seen = 2000.0; // duration=1000s > 30s
+            p.packet_count = 500; // > 200
+            p.outbound_count = 100;
+            p.udp_count = 200; // > tcp*2 and > 30
+            p.tcp_count = 50;
+            *p.dest_ports.entry(1935).or_insert(0) += 20;
+            p.avg_packet_size = 1200.0;
+            p.dest_ips.insert("10.0.0.1".into(), 50);
+            corr.profiles.insert("192.168.1.50".into(), p);
+            corr
+        };
+
+        // Without corporate mode — streaming should fire
+        let mut corr1 = make_corr();
+        let findings = corr1.correlate_with_devices(&devices, false);
+        let has_streaming = findings.iter().any(|f| f.kind == FindingKind::StreamingMedia);
+        assert!(has_streaming, "streaming detector should fire without corporate mode");
+
+        // With corporate mode — streaming should NOT fire
+        let mut corr2 = make_corr();
+        let findings = corr2.correlate_with_devices(&devices, true);
+        let has_streaming = findings.iter().any(|f| f.kind == FindingKind::StreamingMedia);
+        assert!(!has_streaming, "streaming detector should NOT fire with corporate mode");
     }
 }

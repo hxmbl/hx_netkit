@@ -15,7 +15,7 @@ pub struct NetworkContext {
     pub behavioral_summaries: Vec<BehavioralSummary>,
 }
 
-pub fn build_network_context(db_path: &Path) -> NetworkContext {
+pub fn build_network_context(db_path: &Path, corporate_mode: bool) -> NetworkContext {
     let conn = init_db(db_path);
     let total: u64 = conn.query_row("SELECT COUNT(*) FROM packets", [], |r| r.get(0)).unwrap_or(0);
     eprint!("[System] Loading {} packets...", total);
@@ -33,7 +33,7 @@ pub fn build_network_context(db_path: &Path) -> NetworkContext {
 
     let mut correlator = Correlator::new();
     correlator.ingest_batch(packets);
-    let findings = correlator.correlate_with_devices(&devices);
+    let findings = correlator.correlate_with_devices(&devices, corporate_mode);
     let cross_ref = correlator.cross_reference(&devices);
     let behavioral_summaries = generate_behavioral_summaries(&correlator, &devices, &findings);
 

@@ -270,11 +270,16 @@ fn is_safe_search(query: &str) -> bool {
 pub fn run_tool_nmap(target: &str) -> ToolResult {
     println!("\n  [Tool] Running nmap on {}...", target);
     let args = vec!["-sn", "-T5", "--max-retries", "1", "--host-timeout", "5s", target];
-    let output = sudo_cmd("nmap").args(&args)
-        .output().expect("Failed to run nmap");
+    let output = match sudo_cmd("nmap").args(&args).output() {
+        Ok(o) => o,
+        Err(e) => return ToolResult { tool_name: "nmap".into(), summary: format!("nmap failed: {}", e), output: format!("Error: {}", e) },
+    };
     let xml = String::from_utf8_lossy(&output.stdout);
 
-    let conn = Connection::open(":memory:").unwrap();
+    let conn = match Connection::open(":memory:") {
+        Ok(c) => c,
+        Err(e) => return ToolResult { tool_name: "nmap".into(), summary: "memory DB failed".into(), output: format!("Error: {}", e) },
+    };
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
     let summary = crate::context::parse_nmap_xml(&xml, &conn, now);
 
@@ -292,10 +297,13 @@ pub fn run_tool_tshark(filter: &str, duration: u64, _db_path: &Path) -> ToolResu
     println!("\n  [Tool] Capturing traffic for {}s (interface: {}, filter: {})...", duration, iface, filter);
     let args = tshark_args(&iface, filter);
 
-    let mut child = sudo_cmd("tshark").args(&args)
+    let mut child = match sudo_cmd("tshark").args(&args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped()).stderr(Stdio::null())
-        .spawn().expect("Failed to start tshark");
+        .spawn() {
+            Ok(c) => c,
+            Err(e) => return ToolResult { tool_name: "tshark".into(), summary: format!("tshark failed: {}", e), output: format!("Error: {}", e) },
+        };
 
     let child_pid = child.id();
     let timer = std::thread::spawn(move || {

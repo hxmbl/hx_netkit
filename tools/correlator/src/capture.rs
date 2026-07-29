@@ -28,11 +28,16 @@ pub fn run_capture(interface: &str, target: &str, duration: u64, no_save: bool, 
     let tshark_child = if !no_tshark {
         println!("[System] Starting TShark on {} for {}s...", interface, duration);
         let args = tshark_args(interface, "");
-        let child = sudo_cmd("tshark").args(&args)
+        match sudo_cmd("tshark").args(&args)
             .stdin(std::process::Stdio::inherit())
             .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null())
-            .spawn().expect("Failed to start tshark");
-        Some(child)
+            .spawn() {
+                Ok(child) => Some(child),
+                Err(e) => {
+                    eprintln!("[Error] Failed to start tshark: {}. Is it installed?", e);
+                    None
+                }
+            }
     } else {
         None
     };
@@ -42,22 +47,27 @@ pub fn run_capture(interface: &str, target: &str, duration: u64, no_save: bool, 
         let mut args: Vec<&str> = constants::nmap_flags(stealth_level, fast).to_vec();
         args.push(target);
 
-        let output = sudo_cmd("nmap").args(&args)
+        match sudo_cmd("nmap").args(&args)
             .stdin(std::process::Stdio::inherit())
-            .output().expect("Failed to run nmap");
-
-        let xml_str = String::from_utf8_lossy(&output.stdout);
-        if !xml_str.is_empty() {
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
-            let c = conn.lock().unwrap();
-            let summary = parse_nmap_xml(&xml_str, &c, now);
-            c.execute(
-                "INSERT INTO nmap_scans (target, scan_time, raw_xml, summary) VALUES (?1, ?2, ?3, ?4)",
-                params![target, now, xml_str.to_string(), summary.clone()],
-            ).expect("Failed to store scan");
-            let device_count: u64 = c.query_row("SELECT COUNT(*) FROM devices", [], |r| r.get(0)).unwrap_or(0);
-            println!("[nmap] Found {} devices:\n{}", device_count, summary);
-        }
+            .output() {
+                Ok(output) => {
+                    let xml_str = String::from_utf8_lossy(&output.stdout);
+                    if !xml_str.is_empty() {
+                        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+                        let c = conn.lock().unwrap();
+                        let summary = parse_nmap_xml(&xml_str, &c, now);
+                        let _ = c.execute(
+                            "INSERT INTO nmap_scans (target, scan_time, raw_xml, summary) VALUES (?1, ?2, ?3, ?4)",
+                            params![target, now, xml_str.to_string(), summary.clone()],
+                        );
+                        let device_count: u64 = c.query_row("SELECT COUNT(*) FROM devices", [], |r| r.get(0)).unwrap_or(0);
+                        println!("[nmap] Found {} devices:\n{}", device_count, summary);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[Error] Failed to run nmap: {}. Is it installed?", e);
+                }
+            }
     }
 
     if let Some(mut child) = tshark_child {
