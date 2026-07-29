@@ -265,11 +265,7 @@ impl IpProfile {
                 });
                 session.last_packet = pkt.epoch;
                 session.pkt_count += 1;
-                if sp == 80 || sp == 443 || dp == 80 || dp == 443 {
-                    session.bytes_approx += 1500; // rough MTU estimate
-                } else {
-                    session.bytes_approx += 64;
-                }
+                session.bytes_approx += pkt.frame_len.unwrap_or(64) as u64;
             }
         }
 
@@ -335,8 +331,8 @@ impl IpProfile {
 
         // Port classification
         for &port in self.src_ports.keys() {
-            if port < 1024 { self.privileged_ports.push(port); }
-            else if port >= 49152 { self.ephemeral_ports.push(port); }
+            if port < PRIVILEGED_PORT_MAX as u32 { self.privileged_ports.push(port); }
+            else if port >= EPHEMERAL_PORT_MIN { self.ephemeral_ports.push(port); }
             else { self.well_known_ports.push(port); }
         }
 
@@ -346,7 +342,7 @@ impl IpProfile {
             self.src_ips.len() as u64;
 
         // Burst detection
-        if self.temporal_bins.len() >= 3 {
+        if self.temporal_bins.len() >= MIN_BINS_FOR_BURST {
             let counts: Vec<u64> = self.temporal_bins.iter().map(|b| b.count).collect();
             let mean = counts.iter().sum::<u64>() as f64 / counts.len() as f64;
             if mean > 0.0 {
@@ -414,17 +410,17 @@ fn detect_browser(profile: &IpProfile) -> Option<Finding> {
     let mut indicators = Vec::new();
 
     let https_dests = profile.dest_ports.get(&443).copied().unwrap_or(0);
-    if https_dests > 15 {
+    if https_dests > BROWSER_HTTPS_MIN as u64 {
         score += 0.25;
         indicators.push(format!("{} HTTPS connections", https_dests));
     }
 
-    if profile.dns_domains.len() > 20 {
+    if profile.dns_domains.len() > BROWSER_DOMAINS_MIN {
         score += 0.25;
         indicators.push(format!("{} unique domains resolved", profile.dns_domains.len()));
     }
 
-    if profile.src_ports.len() > 25 {
+    if profile.src_ports.len() > BROWSER_SRC_PORTS_MIN {
         score += 0.15;
         indicators.push(format!("{} ephemeral source ports", profile.src_ports.len()));
     }
@@ -433,24 +429,24 @@ fn detect_browser(profile: &IpProfile) -> Option<Finding> {
     let browser_hits: Vec<_> = profile.dns_domains.keys()
         .filter(|d| BROWSER_DOMAINS.iter().any(|bd| d.ends_with(bd)))
         .collect();
-    if browser_hits.len() >= 3 {
+    if browser_hits.len() >= BROWSER_CDN_HITS_MIN {
         score += 0.2;
         indicators.push(format!("{} browser CDNs contacted", browser_hits.len()));
     }
 
     // Port entropy — browsers have high entropy (many different ports)
-    if profile.dest_port_entropy > 2.5 {
+    if profile.dest_port_entropy > BROWSER_PORT_ENTROPY_MIN {
         score += 0.1;
         indicators.push(format!("high port entropy: {:.2}", profile.dest_port_entropy));
     }
 
     // Connection diversity
-    if profile.dest_ips.len() > 10 {
+    if profile.dest_ips.len() > BROWSER_DEST_IPS_MIN {
         score += 0.1;
         indicators.push(format!("{} distinct destination IPs", profile.dest_ips.len()));
     }
 
-    if score >= 0.35 {
+    if score >= FINDING_THRESHOLD {
         Some(Finding {
             ip: profile.ip.clone(),
             kind: FindingKind::Browser,
@@ -467,24 +463,24 @@ fn detect_bot(profile: &IpProfile) -> Option<Finding> {
     let mut score: f64 = 0.0;
     let mut indicators = Vec::new();
 
-    if profile.packet_count < 15 { return None; }
+    if profile.packet_count < BOT_MIN_PACKETS { return None; }
 
     // Regular interval detection via autocorrelation
     let intervals: Vec<f64> = profile.inter_arrival_times.windows(2)
         .map(|w| (w[1] - w[0]).abs())
-        .filter(|&x| x > 0.01)
+        .filter(|&x| x > BOT_INTERVAL_NOISE_FLOOR)
         .collect();
 
-    if intervals.len() >= 5 {
+    if intervals.len() >= BOT_MIN_SAMPLES {
         let mean = intervals.iter().sum::<f64>() / intervals.len() as f64;
         if mean > 0.0 {
             let variance = intervals.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / intervals.len() as f64;
             let cv = variance.sqrt() / mean;
 
-            if cv < 0.1 && mean > 0.5 {
+            if cv < BOT_PRECISION_CV && mean > BOT_PRECISION_MEAN {
                 score += 0.4;
                 indicators.push(format!("precision beacon: {:.2}s interval (CV: {:.4})", mean, cv));
-            } else if cv < 0.2 && mean > 1.0 {
+            } else if cv < BOT_REGULAR_CV && mean > BOT_REGULAR_MEAN {
                 score += 0.3;
                 indicators.push(format!("regular interval: {:.1}s (CV: {:.3})", mean, cv));
             }
@@ -504,7 +500,7 @@ fn detect_bot(profile: &IpProfile) -> Option<Finding> {
                     autocorr = autocorr.max(corr);
                 }
             }
-            if autocorr > 0.7 {
+            if autocorr > BOT_AUTOCORR_MIN {
                 score += 0.2;
                 indicators.push(format!("high autocorrelation: {:.3}", autocorr));
             }
@@ -514,25 +510,25 @@ fn detect_bot(profile: &IpProfile) -> Option<Finding> {
     // Monotonic port behavior
     if let Some((&port, &count)) = profile.dest_ports.iter().max_by_key(|(_, c)| *c) {
         let pct = count as f64 / profile.packet_count as f64;
-        if pct > 0.85 && count > 30 {
+        if pct > BOT_MONOTONIC_PORT_PCT && count > BOT_MONOTONIC_PORT_MIN {
             score += 0.25;
             indicators.push(format!("{:.0}% of traffic to port {}", pct * 100.0, port));
         }
     }
 
     // Low DNS diversity despite high connections
-    if profile.dns_domains.len() <= 2 && profile.outbound_count > 40 {
+    if profile.dns_domains.len() <= BOT_LOW_DNS_DOMAINS && profile.outbound_count > BOT_LOW_DNS_OUTBOUND {
         score += 0.2;
         indicators.push("pre-programmed IPs, minimal DNS".into());
     }
 
     // Burst pattern — very consistent bursts
-    if profile.burst_score > 0.0 && profile.burst_score < 0.3 && profile.packet_count > 50 {
+    if profile.burst_score > BOT_BURST_MIN && profile.burst_score < BOT_BURST_MAX && profile.packet_count > 50 {
         score += 0.1;
         indicators.push(format!("regular burst pattern (CV: {:.3})", profile.burst_score));
     }
 
-    if score >= 0.4 {
+    if score >= BOT_THRESHOLD {
         Some(Finding {
             ip: profile.ip.clone(),
             kind: FindingKind::Bot,
@@ -550,7 +546,7 @@ fn detect_server(profile: &IpProfile) -> Option<Finding> {
     let mut indicators = Vec::new();
 
     // Many unique source IPs connecting in
-    if profile.src_ips.len() > 8 {
+    if profile.src_ips.len() > SERVER_CLIENTS_MIN {
         score += 0.3;
         indicators.push(format!("{} unique clients", profile.src_ips.len()));
     }
@@ -567,21 +563,21 @@ fn detect_server(profile: &IpProfile) -> Option<Finding> {
     // Inbound-heavy ratio
     if profile.inbound_count > 0 {
         let ratio = profile.inbound_count as f64 / profile.outbound_count.max(1) as f64;
-        if ratio > 2.0 {
+        if ratio > SERVER_INBOUND_RATIO {
             score += 0.2;
             indicators.push(format!("inbound ratio: {:.1}:1", ratio));
         }
     }
 
     // Responding to many client ports
-    if profile.dest_ports.len() > 15 {
+    if profile.dest_ports.len() > SERVER_DEST_PORTS_MIN {
         score += 0.15;
         indicators.push(format!("responding to {} client ports", profile.dest_ports.len()));
     }
 
     // Long-lived sessions
-    let long_sessions = profile.sessions.values().filter(|s| s.last_packet - s.first_packet > 30.0).count();
-    if long_sessions > 3 {
+    let long_sessions = profile.sessions.values().filter(|s| s.last_packet - s.first_packet > SERVER_LONG_SESSION_SECS).count();
+    if long_sessions > SERVER_LONG_SESSIONS_MIN {
         score += 0.1;
         indicators.push(format!("{} long-lived sessions", long_sessions));
     }
@@ -611,7 +607,7 @@ fn detect_iot(profile: &IpProfile) -> Option<Finding> {
     }
 
     // Few external connections
-    if profile.dest_ips.len() <= 4 && profile.packet_count > 30 {
+    if profile.dest_ips.len() <= IOT_MAX_DEST_IPS && profile.packet_count > 30 {
         score += 0.15;
         indicators.push(format!("only {} external IPs", profile.dest_ips.len()));
     }
@@ -620,20 +616,20 @@ fn detect_iot(profile: &IpProfile) -> Option<Finding> {
     let duration = profile.last_seen - profile.first_seen;
     if duration > 0.0 {
         let pps = profile.packet_count as f64 / duration;
-        if pps < 3.0 && profile.packet_count > 20 {
+        if pps < IOT_MAX_PPS && profile.packet_count > 20 {
             score += 0.15;
             indicators.push(format!("low rate: {:.1} pps", pps));
         }
     }
 
     // Few DNS queries
-    if profile.dns_count < 5 && profile.packet_count > 30 {
+    if profile.dns_count < IOT_MAX_DNS && profile.packet_count > 30 {
         score += 0.15;
         indicators.push(format!("{} DNS queries", profile.dns_count));
     }
 
     // Regular heartbeat
-    if profile.burst_score < 0.4 && profile.burst_score > 0.0 && duration > 10.0 {
+    if profile.burst_score < IOT_HEARTBEAT_BURST_MAX && profile.burst_score > IOT_HEARTBEAT_BURST_MIN && duration > 10.0 {
         score += 0.1;
         indicators.push("heartbeat pattern".into());
     }
@@ -664,13 +660,13 @@ fn detect_dns_profiler(profile: &IpProfile) -> Option<Finding> {
     let duration = profile.last_seen - profile.first_seen;
     if duration > 0.0 {
         let qps = profile.dns_count as f64 / duration;
-        if qps > 8.0 {
+        if qps > DNS_QPS_HIGH {
             score += 0.35;
             indicators.push(format!("high DNS rate: {:.1} qps", qps));
         }
     }
 
-    if profile.dns_domains.len() > 60 {
+    if profile.dns_domains.len() > DNS_DOMAINS_HIGH {
         score += 0.3;
         indicators.push(format!("{} unique domains", profile.dns_domains.len()));
     }
@@ -681,7 +677,7 @@ fn detect_dns_profiler(profile: &IpProfile) -> Option<Finding> {
     }
 
     // Single-label DNS queries (DGA-like behavior)
-    if profile.dns_single_labels > 10 {
+    if profile.dns_single_labels > DNS_SINGLE_LABELS_HIGH {
         score += 0.15;
         indicators.push(format!("{} single-label queries", profile.dns_single_labels));
     }
@@ -705,25 +701,25 @@ fn detect_beacon(profile: &IpProfile) -> Option<Finding> {
 
     let intervals: Vec<f64> = profile.inter_arrival_times.windows(2)
         .map(|w| (w[1] - w[0]).abs())
-        .filter(|&x| x > 0.1)
+        .filter(|&x| x > BEACON_INTERVAL_NOISE_FLOOR)
         .collect();
 
-    if intervals.len() < 10 { return None; }
+    if intervals.len() < BEACON_MIN_SAMPLES { return None; }
 
     let mean = intervals.iter().sum::<f64>() / intervals.len() as f64;
-    if mean < 0.5 { return None; }
+    if mean < BEACON_MIN_MEAN { return None; }
 
     let variance = intervals.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / intervals.len() as f64;
     let cv = variance.sqrt() / mean;
 
     // Tight beacon
-    if cv < 0.05 && mean > 5.0 {
+    if cv < BEACON_TIGHT_CV && mean > BEACON_TIGHT_MEAN {
         score += 0.5;
         indicators.push(format!("tight beacon: {:.1}s ± {:.3}s (CV: {:.4})", mean, variance.sqrt(), cv));
     }
 
     // Jittered beacon (common in C2)
-    if cv > 0.05 && cv < 0.25 && mean > 10.0 {
+    if cv > BEACON_JITTER_CV_MIN && cv < BEACON_JITTER_CV_MAX && mean > BEACON_JITTER_MEAN {
         score += 0.35;
         indicators.push(format!("jittered beacon: {:.1}s (CV: {:.3})", mean, cv));
     }
@@ -757,7 +753,7 @@ fn detect_scanner(profile: &IpProfile) -> Option<Finding> {
     let mut score: f64 = 0.0;
     let mut indicators = Vec::new();
 
-    if profile.dest_ports.len() > 20 {
+    if profile.dest_ports.len() > SCANNER_PORT_THRESHOLD {
         score += 0.35;
         indicators.push(format!("port scanning: {} unique ports", profile.dest_ports.len()));
     }
@@ -768,12 +764,12 @@ fn detect_scanner(profile: &IpProfile) -> Option<Finding> {
         0.0
     };
 
-    if profile.dest_ips.len() > 15 && avg_pkts_per_dest < 2.0 {
+    if profile.dest_ips.len() > SCANNER_HOST_THRESHOLD && avg_pkts_per_dest < SCANNER_PKTS_PER_HOST {
         score += 0.3;
         indicators.push(format!("network scan: {} hosts, {:.1} pkts/host", profile.dest_ips.len(), avg_pkts_per_dest));
     }
 
-    if profile.outbound_count > 80 && profile.inbound_count < profile.outbound_count / 8 {
+    if profile.outbound_count > SCANNER_OUTBOUND_MIN && profile.inbound_count < profile.outbound_count / SCANNER_RESPONSE_RATIO as u64 {
         score += 0.2;
         indicators.push("SYN scan pattern (high outbound, low response)".into());
     }
@@ -810,10 +806,10 @@ fn detect_streaming(profile: &IpProfile) -> Option<Finding> {
     let mut indicators = Vec::new();
 
     let duration = profile.last_seen - profile.first_seen;
-    if duration < 10.0 { return None; }
+    if duration < STREAM_MIN_DURATION { return None; }
 
     // Sustained high volume
-    if profile.packet_count > 200 && duration > 30.0 {
+    if profile.packet_count > STREAM_SUSTAINED_PKTS && duration > STREAM_SUSTAINED_DURATION {
         score += 0.2;
         indicators.push(format!("sustained: {:.0}s, {} pkts", duration, profile.packet_count));
     }
@@ -828,7 +824,7 @@ fn detect_streaming(profile: &IpProfile) -> Option<Finding> {
     }
 
     // UDP-dominant (video streaming often uses UDP/DASH)
-    if profile.udp_count > profile.tcp_count * 2 && profile.udp_count > 30 {
+    if profile.udp_count > profile.tcp_count * STREAM_UDP_DOMINANCE as u64 && profile.udp_count > STREAM_MIN_UDP {
         score += 0.2;
         indicators.push(format!("UDP-dominant: {} UDP, {} TCP", profile.udp_count, profile.tcp_count));
     }
@@ -836,7 +832,7 @@ fn detect_streaming(profile: &IpProfile) -> Option<Finding> {
     // High packet rate
     if duration > 0.0 {
         let pps = profile.packet_count as f64 / duration;
-        if pps > 30.0 {
+        if pps > STREAM_HIGH_PPS {
             score += 0.15;
             indicators.push(format!("high rate: {:.0} pps", pps));
         }
@@ -915,21 +911,21 @@ fn detect_vpn(profile: &IpProfile) -> Option<Finding> {
     }
 
     // Single destination with high volume
-    if profile.dest_ips.len() <= 2 && profile.packet_count > 100 {
+    if profile.dest_ips.len() <= VPN_MAX_DEST_IPS && profile.packet_count > VPN_MIN_PACKETS {
         score += 0.2;
         indicators.push(format!("tunnel to {} IPs", profile.dest_ips.len()));
     }
 
     // High packet rate to single destination
     if let Some((ip, &count)) = profile.dest_ips.iter().max_by_key(|(_, c)| *c) {
-        if count as f64 / profile.packet_count as f64 > 0.9 && count > 50 {
+        if count as f64 / profile.packet_count as f64 > VPN_TUNNEL_RATIO && count > VPN_TUNNEL_MIN {
             score += 0.2;
             indicators.push(format!("dedicated tunnel to {}", ip));
         }
     }
 
     // Encrypted bulk transfer pattern — consistent packet sizes
-    if profile.packet_count > 50 && profile.packet_size_variance < 1000.0 {
+    if profile.packet_count > 50 && profile.packet_size_variance < VPN_UNIFORM_VARIANCE_MAX {
         score += 0.1;
         indicators.push("uniform packet sizes (encrypted tunnel)".into());
     }
@@ -1008,7 +1004,7 @@ fn detect_game(profile: &IpProfile) -> Option<Finding> {
     let duration = profile.last_seen - profile.first_seen;
     if duration > 0.0 {
         let pps = profile.packet_count as f64 / duration;
-        if pps > 10.0 && pps < 200.0 {
+        if pps > GAME_PPS_MIN && pps < GAME_PPS_MAX {
             score += 0.15;
             indicators.push(format!("game-like rate: {:.0} pps", pps));
         }
@@ -1053,13 +1049,13 @@ fn detect_lateral_movement(profile: &IpProfile, all_profiles: &HashMap<String, I
     let internal_dests: Vec<_> = profile.dest_ips.keys().filter(|ip| is_private_ip(ip)).collect();
     let internal_count = internal_dests.len();
 
-    if internal_count < 4 { return None; }
+    if internal_count < LATERAL_MIN_INTERNAL_HOSTS { return None; }
 
     score += 0.25;
     indicators.push(format!("connecting to {} internal hosts", internal_count));
 
-    let unique_ports: Vec<_> = profile.dest_ports.keys().filter(|p| **p < 1024 || **p == 8080 || **p == 3389).collect();
-    if unique_ports.len() >= 3 {
+    let unique_ports: Vec<_> = profile.dest_ports.keys().filter(|p| **p < PRIVILEGED_PORT_MAX as u32 || **p == 8080 || **p == 3389).collect();
+    if unique_ports.len() >= LATERAL_MIN_MGMT_PORTS {
         score += 0.25;
         indicators.push(format!("using {} management ports: {}", unique_ports.len(),
             unique_ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")));
@@ -1071,7 +1067,7 @@ fn detect_lateral_movement(profile: &IpProfile, all_profiles: &HashMap<String, I
         .sum();
     let total_out = profile.outbound_count.max(1) as f64;
     let internal_ratio = internal_pkts as f64 / total_out;
-    if internal_ratio > 0.6 {
+    if internal_ratio > LATERAL_INTERNAL_RATIO {
         score += 0.2;
         indicators.push(format!("{:.0}% traffic to internal hosts", internal_ratio * 100.0));
     }
@@ -1079,13 +1075,13 @@ fn detect_lateral_movement(profile: &IpProfile, all_profiles: &HashMap<String, I
     let others_can_see: Vec<_> = internal_dests.iter()
         .filter(|dest| all_profiles.contains_key(dest.as_str()))
         .collect();
-    if others_can_see.len() >= 2 {
+    if others_can_see.len() >= LATERAL_OVERLAP_MIN {
         score += 0.15;
         indicators.push(format!("{} target hosts have traffic profiles", others_can_see.len()));
     }
 
     let duration = profile.last_seen - profile.first_seen;
-    if duration > 0.0 && internal_count as f64 / duration > 0.5 {
+    if duration > 0.0 && internal_count as f64 / duration > LATERAL_SCAN_RATE {
         score += 0.1;
         indicators.push(format!("rapid internal scanning: {:.1} hosts/s", internal_count as f64 / duration));
     }
@@ -1115,7 +1111,7 @@ fn detect_data_exfil(profile: &IpProfile) -> Option<Finding> {
 
     if profile.inbound_count > 0 {
         let ratio = profile.outbound_count as f64 / profile.inbound_count as f64;
-        if ratio > 8.0 && profile.outbound_count > 50 {
+        if ratio > EXFIL_OUTBOUND_RATIO && profile.outbound_count > EXFIL_MIN_OUTBOUND {
             score += 0.35;
             indicators.push(format!("high outbound ratio: {:.1}:1 ({} out, {} in)", ratio, profile.outbound_count, profile.inbound_count));
         }
@@ -1123,19 +1119,19 @@ fn detect_data_exfil(profile: &IpProfile) -> Option<Finding> {
 
     if let Some((ip, &count)) = external_dests.iter().max_by_key(|(_, c)| *c) {
         let pct = count as f64 / profile.packet_count as f64;
-        if pct > 0.85 && count > 40 {
+        if pct > EXFIL_SINGLE_DEST_PCT && count > EXFIL_SINGLE_DEST_MIN {
             score += 0.3;
             indicators.push(format!("{}% of outbound to single IP {} ({})", (pct * 100.0) as u32, ip, count));
         }
     }
 
-    if profile.dns_domains.len() <= 3 && profile.outbound_count > 60 {
+    if profile.dns_domains.len() <= EXFIL_LOW_DNS_DOMAINS && profile.outbound_count > EXFIL_LOW_DNS_OUTBOUND {
         score += 0.15;
         indicators.push(format!("only {} DNS domains with {} outbound packets (pre-configured destination)", profile.dns_domains.len(), profile.outbound_count));
     }
 
     let duration = profile.last_seen - profile.first_seen;
-    if duration > 60.0 && profile.outbound_count > 100 {
+    if duration > EXFIL_SUSTAINED_DURATION && profile.outbound_count > EXFIL_SUSTAINED_OUTBOUND {
         score += 0.1;
         indicators.push(format!("sustained over {:.0}s", duration));
     }
@@ -1159,17 +1155,17 @@ fn detect_c2_beacon(profile: &IpProfile) -> Option<Finding> {
 
     let intervals: Vec<f64> = profile.inter_arrival_times.windows(2)
         .map(|w| (w[1] - w[0]).abs())
-        .filter(|&x| x > 0.5)
+        .filter(|&x| x > C2_INTERVAL_NOISE_FLOOR)
         .collect();
 
-    if intervals.len() < 8 { return None; }
+    if intervals.len() < C2_MIN_SAMPLES { return None; }
 
     let mean = intervals.iter().sum::<f64>() / intervals.len() as f64;
     let variance = intervals.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / intervals.len() as f64;
     let cv = variance.sqrt() / mean;
 
-    let is_regular = cv < 0.15 && mean > 5.0;
-    let is_jittered = (0.05..0.3).contains(&cv) && mean > 10.0;
+    let is_regular = cv < C2_REGULAR_CV && mean > C2_REGULAR_MEAN;
+    let is_jittered = (C2_JITTER_CV_MIN..C2_JITTER_CV_MAX).contains(&cv) && mean > C2_JITTER_MEAN;
 
     if !is_regular && !is_jittered { return None; }
 
@@ -1223,13 +1219,13 @@ fn detect_network_recon(profile: &IpProfile) -> Option<Finding> {
     let mgmt_ports = [22, 23, 80, 443, 8080, 3389, 5900, 21, 2323, 9100];
     let mgmt_port_hits: Vec<_> = profile.dest_ports.keys().filter(|p| mgmt_ports.contains(p)).collect();
 
-    if mgmt_port_hits.len() < 3 { return None; }
+    if mgmt_port_hits.len() < RECON_MIN_MGMT_PORTS { return None; }
 
     score += 0.3;
     indicators.push(format!("probing management ports: {}", mgmt_port_hits.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")));
 
     let internal_dests: Vec<_> = profile.dest_ips.keys().filter(|ip| is_private_ip(ip)).collect();
-    if internal_dests.len() >= 5 {
+    if internal_dests.len() >= RECON_MIN_INTERNAL_HOSTS {
         score += 0.25;
         indicators.push(format!("targeting {} internal hosts", internal_dests.len()));
     }
@@ -1238,7 +1234,7 @@ fn detect_network_recon(profile: &IpProfile) -> Option<Finding> {
         profile.outbound_count as f64 / internal_dests.len() as f64
     } else { 0.0 };
 
-    if avg_pkts_per_dest < 5.0 && avg_pkts_per_dest > 0.0 {
+    if avg_pkts_per_dest < RECON_MAX_PKTS_PER_HOST && avg_pkts_per_dest > 0.0 {
         score += 0.2;
         indicators.push(format!("light touch: {:.1} pkts/host (probe pattern)", avg_pkts_per_dest));
     }
@@ -1282,7 +1278,7 @@ fn detect_printers_iot(profile: &IpProfile, devices: &[(String, Option<String>, 
     let duration = profile.last_seen - profile.first_seen;
     if duration > 0.0 {
         let pps = profile.packet_count as f64 / duration;
-        if pps < 2.0 && profile.packet_count > 10 {
+        if pps < PRINTER_MAX_PPS && profile.packet_count > 10 {
             score += 0.2;
             indicators.push(format!("very low rate: {:.2} pps", pps));
         }
@@ -1374,7 +1370,7 @@ impl Correlator {
         let all_profiles = self.profiles.clone();
 
         for profile in self.profiles.values() {
-            if profile.packet_count < 8 { continue; }
+            if profile.packet_count < MIN_PACKETS_FOR_DETECTION { continue; }
 
             let mut ip_findings = Vec::new();
             let detectors: Vec<Box<dyn Fn(&IpProfile) -> Option<Finding>>> = vec![
@@ -1484,7 +1480,7 @@ impl Correlator {
                 ));
 
                 let open_tcp: Vec<_> = profile.src_ports.keys()
-                    .filter(|p| **p < 1024)
+        .filter(|p| **p < PRIVILEGED_PORT_MAX as u32)
                     .map(|p| p.to_string())
                     .collect();
                 if !open_tcp.is_empty() {
@@ -1999,6 +1995,397 @@ pub fn print_findings(findings: &[Finding]) {
             }
         }
     }
+}
+
+// ══════════════════════════════════════════════════════════════
+// Behavioral Summaries — plain-English narratives per IP
+// ══════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct BehavioralSummary {
+    pub ip: String,
+    pub hostname: Option<String>,
+    pub device_type: String,
+    pub role: String,
+    pub activity: String,
+    pub temporal: String,
+    pub dns_behavior: String,
+    pub risk_signals: Vec<String>,
+    pub narrative: String,
+}
+
+impl fmt::Display for BehavioralSummary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "### {} ({})", self.ip, self.hostname.as_deref().unwrap_or("unknown"))?;
+        writeln!(f, "Device: {}", self.device_type)?;
+        writeln!(f, "Role: {}", self.role)?;
+        writeln!(f, "Activity: {}", self.activity)?;
+        if !self.temporal.is_empty() {
+            writeln!(f, "Timing: {}", self.temporal)?;
+        }
+        if !self.dns_behavior.is_empty() {
+            writeln!(f, "DNS: {}", self.dns_behavior)?;
+        }
+        if !self.risk_signals.is_empty() {
+            writeln!(f, "Risk: {}", self.risk_signals.join("; "))?;
+        }
+        writeln!(f, "Summary: {}", self.narrative)
+    }
+}
+
+pub fn generate_behavioral_summaries(
+    correlator: &mut Correlator,
+    devices: &[(String, Option<String>, Option<String>, Option<String>, Option<String>, String)],
+) -> Vec<BehavioralSummary> {
+    let findings = correlator.correlate_with_devices(devices);
+    let mut summaries = Vec::new();
+
+    for profile in correlator.profiles.values() {
+        if profile.packet_count < MIN_PACKETS_FOR_DETECTION { continue; }
+
+        let ip_findings: Vec<&Finding> = findings.iter().filter(|f| f.ip == profile.ip).collect();
+        let device_info = devices.iter().find(|(ip, _, _, _, _, _)| ip == &profile.ip);
+
+        let hostname = device_info.and_then(|(_, _, h, _, _, _)| h.clone());
+        let os_guess = device_info.and_then(|(_, _, _, _, o, _)| o.clone());
+        let vendor = device_info.and_then(|(_, _, _, v, _, _)| v.clone());
+
+        // ── Device type ──
+        let device_type = classify_device_type(profile, &ip_findings, hostname.as_deref(), vendor.as_deref(), os_guess.as_deref());
+
+        // ── Role ──
+        let role = determine_role(profile, &ip_findings);
+
+        // ── Activity narrative ──
+        let activity = describe_activity(profile, &ip_findings);
+
+        // ── Temporal pattern ──
+        let temporal = describe_temporal(profile);
+
+        // ── DNS behavior ──
+        let dns_behavior = describe_dns(profile);
+
+        // ── Risk signals ──
+        let risk_signals = extract_risk_signals(profile, &ip_findings);
+
+        // ── Full narrative ──
+        let narrative = build_narrative(profile, &ip_findings, &device_type, &role, &activity, &temporal);
+
+        summaries.push(BehavioralSummary {
+            ip: profile.ip.clone(),
+            hostname,
+            device_type,
+            role,
+            activity,
+            temporal,
+            dns_behavior,
+            risk_signals,
+            narrative,
+        });
+    }
+
+    summaries.sort_by(|a, b| {
+        // High-risk first, then by packet count
+        let risk_a = a.risk_signals.len();
+        let risk_b = b.risk_signals.len();
+        risk_b.cmp(&risk_a)
+    });
+
+    summaries
+}
+
+fn classify_device_type(
+    profile: &IpProfile,
+    findings: &[&Finding],
+    hostname: Option<&str>,
+    _vendor: Option<&str>,
+    os_guess: Option<&str>,
+) -> String {
+    let has = |kind: &FindingKind| findings.iter().any(|f| &f.kind == kind);
+
+    if has(&FindingKind::PrinterIoT) {
+        let name = hostname.unwrap_or("unknown");
+        format!("Printer/IoT device ({})", name)
+    } else if has(&FindingKind::IoTDevice) {
+        "IoT/embedded device".to_string()
+    } else if has(&FindingKind::Server) {
+        let name = hostname.unwrap_or("unknown");
+        format!("Server ({})", name)
+    } else if has(&FindingKind::Browser) {
+        let os = os_guess.unwrap_or("unknown OS");
+        format!("User workstation ({})", os)
+    } else if has(&FindingKind::GameClient) {
+        "Gaming device".to_string()
+    } else if has(&FindingKind::VPN) {
+        "VPN client".to_string()
+    } else {
+        // Fallback heuristics
+        if profile.dns_count < 3 && profile.packet_count > 30 && profile.udp_count > profile.tcp_count {
+            "Embedded/IoT device (low DNS, UDP-dominant)".to_string()
+        } else if profile.src_ips.len() > 5 {
+            "Likely server/service (many clients)".to_string()
+        } else if profile.outbound_count > profile.inbound_count * 3 {
+            "Outbound-heavy client".to_string()
+        } else {
+            "Generic network device".to_string()
+        }
+    }
+}
+
+fn determine_role(profile: &IpProfile, findings: &[&Finding]) -> String {
+    let has = |kind: &FindingKind| findings.iter().any(|f| &f.kind == kind);
+
+    let mut roles = Vec::new();
+
+    if has(&FindingKind::Server) {
+        roles.push("serving traffic to other devices");
+    }
+    if has(&FindingKind::Browser) {
+        roles.push("browsing the web");
+    }
+    if has(&FindingKind::StreamingMedia) {
+        roles.push("streaming media content");
+    }
+    if has(&FindingKind::CloudSync) {
+        roles.push("syncing with cloud services");
+    }
+    if has(&FindingKind::GameClient) {
+        roles.push("online gaming");
+    }
+    if has(&FindingKind::VPN) {
+        roles.push("tunneling traffic via VPN");
+    }
+    if has(&FindingKind::IoTDevice) || has(&FindingKind::PrinterIoT) {
+        roles.push("providing IoT/printer services");
+    }
+    if has(&FindingKind::Scanner) || has(&FindingKind::NetworkRecon) {
+        roles.push("scanning/reconnaissance");
+    }
+    if has(&FindingKind::Bot) {
+        roles.push("automated bot activity");
+    }
+    if has(&FindingKind::Beacon) || has(&FindingKind::C2Beacon) {
+        roles.push("beaconing to remote host");
+    }
+    if has(&FindingKind::DataExfil) {
+        roles.push("high outbound data transfer");
+    }
+    if has(&FindingKind::LateralMovement) {
+        roles.push("moving laterally across internal hosts");
+    }
+
+    if roles.is_empty() {
+        // Fallback based on traffic pattern
+        let in_ratio = profile.inbound_count as f64 / profile.packet_count.max(1) as f64;
+        if in_ratio > 0.7 {
+            "receiving most traffic (possible target/service)".to_string()
+        } else if in_ratio < 0.3 {
+            "sending most traffic (client/uploader)".to_string()
+        } else {
+            "balanced send/receive".to_string()
+        }
+    } else {
+        roles.join(", ")
+    }
+}
+
+fn describe_activity(profile: &IpProfile, _findings: &[&Finding]) -> String {
+    let duration = profile.last_seen - profile.first_seen;
+    let pps = if duration > 0.0 { profile.packet_count as f64 / duration } else { 0.0 };
+
+    let mut parts = Vec::new();
+
+    // Volume description
+    if profile.packet_count > 5000 {
+        parts.push(format!("very high volume ({} packets)", profile.packet_count));
+    } else if profile.packet_count > 1000 {
+        parts.push(format!("moderate volume ({} packets)", profile.packet_count));
+    } else if profile.packet_count > 100 {
+        parts.push(format!("light volume ({} packets)", profile.packet_count));
+    } else {
+        parts.push(format!("minimal traffic ({} packets)", profile.packet_count));
+    }
+
+    // Rate
+    if pps > 100.0 {
+        parts.push(format!("high rate ({:.0} pkt/s)", pps));
+    } else if pps > 10.0 {
+        parts.push(format!("moderate rate ({:.1} pkt/s)", pps));
+    } else if pps > 1.0 {
+        parts.push(format!("low rate ({:.1} pkt/s)", pps));
+    }
+
+    // Direction
+    if profile.outbound_count > profile.inbound_count * 3 {
+        parts.push("mostly outbound".to_string());
+    } else if profile.inbound_count > profile.outbound_count * 3 {
+        parts.push("mostly inbound".to_string());
+    }
+
+    // Protocol
+    if profile.udp_count > profile.tcp_count * 2 {
+        parts.push(format!("UDP-dominant ({} UDP vs {} TCP)", profile.udp_count, profile.tcp_count));
+    } else if profile.tcp_count > profile.udp_count * 2 {
+        parts.push(format!("TCP-dominant ({} TCP vs {} UDP)", profile.tcp_count, profile.udp_count));
+    }
+
+    parts.join(", ")
+}
+
+fn describe_temporal(profile: &IpProfile) -> String {
+    let duration = profile.last_seen - profile.first_seen;
+
+    if duration < 1.0 {
+        return "brief burst".to_string();
+    }
+
+    let mut parts = Vec::new();
+
+    // Duration
+    if duration > 3600.0 {
+        parts.push(format!("active for {:.0} minutes", duration / 60.0));
+    } else if duration > 60.0 {
+        parts.push(format!("active for {:.0} seconds", duration));
+    } else {
+        parts.push(format!("active for {:.1} seconds", duration));
+    }
+
+    // Burst pattern
+    if profile.burst_score > 1.0 {
+        parts.push("highly bursty (clustered traffic)".to_string());
+    } else if profile.burst_score > 0.5 {
+        parts.push("somewhat bursty".to_string());
+    } else if profile.burst_score > 0.0 && profile.burst_score < 0.2 {
+        parts.push("very regular spacing".to_string());
+    }
+
+    // Session count
+    if profile.sessions.len() > 50 {
+        parts.push(format!("{} distinct sessions", profile.sessions.len()));
+    } else if profile.sessions.len() > 10 {
+        parts.push(format!("{} sessions", profile.sessions.len()));
+    }
+
+    parts.join(", ")
+}
+
+fn describe_dns(profile: &IpProfile) -> String {
+    if profile.dns_count == 0 && profile.dns_domains.is_empty() {
+        return "no DNS activity".to_string();
+    }
+
+    let mut parts = Vec::new();
+    parts.push(format!("{} queries, {} unique domains", profile.dns_count, profile.dns_domains.len()));
+
+    if !profile.dns_domains.is_empty() {
+        let mut domains: Vec<_> = profile.dns_domains.iter().collect();
+        domains.sort_by(|a, b| b.1.cmp(a.1));
+        let top: Vec<String> = domains.iter().take(3).map(|(d, c)| format!("{}({})", d, c)).collect();
+        parts.push(format!("top: {}", top.join(", ")));
+    }
+
+    if profile.dns_single_labels > 5 {
+        parts.push(format!("{} single-label queries (DGA-like)", profile.dns_single_labels));
+    }
+
+    parts.join("; ")
+}
+
+fn extract_risk_signals(profile: &IpProfile, findings: &[&Finding]) -> Vec<String> {
+    let mut signals = Vec::new();
+
+    for f in findings {
+        match f.kind {
+            FindingKind::C2Beacon => signals.push(format!("C2 beacon detected ({:.0}% confidence)", f.confidence * 100.0)),
+            FindingKind::DataExfil => signals.push(format!("data exfiltration pattern ({:.0}%)", f.confidence * 100.0)),
+            FindingKind::LateralMovement => signals.push(format!("lateral movement ({:.0}%)", f.confidence * 100.0)),
+            FindingKind::Scanner => signals.push(format!("scanning activity ({:.0}%)", f.confidence * 100.0)),
+            FindingKind::NetworkRecon => signals.push(format!("network reconnaissance ({:.0}%)", f.confidence * 100.0)),
+            FindingKind::Tor => signals.push(format!("Tor relay/usage ({:.0}%)", f.confidence * 100.0)),
+            FindingKind::Bot => signals.push(format!("automated bot behavior ({:.0}%)", f.confidence * 100.0)),
+            FindingKind::Beacon => signals.push(format!("periodic beaconing ({:.0}%)", f.confidence * 100.0)),
+            FindingKind::DNSProfiler => signals.push(format!("DNS profiling/enumeration ({:.0}%)", f.confidence * 100.0)),
+            _ => {}
+        }
+    }
+
+    // Additional heuristic risk signals
+    if profile.dns_single_labels > 10 {
+        signals.push(format!("DGA-like DNS: {} single-label queries", profile.dns_single_labels));
+    }
+
+    let internal_dests = profile.dest_ips.keys().filter(|ip| is_private_ip(ip)).count();
+    if internal_dests > 5 && profile.outbound_count > 20 {
+        signals.push(format!("talking to {} internal hosts (possible lateral movement)", internal_dests));
+    }
+
+    signals
+}
+
+fn build_narrative(
+    profile: &IpProfile,
+    findings: &[&Finding],
+    device_type: &str,
+    role: &str,
+    _activity: &str,
+    temporal: &str,
+) -> String {
+    let duration = profile.last_seen - profile.first_seen;
+    let pps = if duration > 0.0 { profile.packet_count as f64 / duration } else { 0.0 };
+
+    // Build the story
+    let mut narrative = format!("{} is {} on the network. ", device_type, role);
+
+    // What domains?
+    if !profile.dns_domains.is_empty() {
+        let domain_count = profile.dns_domains.len();
+        if domain_count > 30 {
+            narrative.push_str(&format!("It resolved {} unique domains, suggesting extensive web activity. ", domain_count));
+        } else if domain_count > 10 {
+            narrative.push_str(&format!("It resolved {} domains. ", domain_count));
+        } else if domain_count > 0 {
+            let top: Vec<&String> = profile.dns_domains.keys().take(3).collect();
+            narrative.push_str(&format!("It primarily contacts {}. ", top.iter().map(|d| d.as_str()).collect::<Vec<_>>().join(", ")));
+        }
+    }
+
+    // What ports?
+    if !profile.dest_ports.is_empty() {
+        let mut ports: Vec<_> = profile.dest_ports.iter().collect();
+        ports.sort_by(|a, b| b.1.cmp(a.1));
+        let top_ports: Vec<String> = ports.iter().take(3).map(|(p, c)| format!("{}({})", p, c)).collect();
+        narrative.push_str(&format!("Top destination ports: {}. ", top_ports.join(", ")));
+    }
+
+    // How much traffic?
+    if pps > 100.0 {
+        narrative.push_str(&format!("Traffic is very heavy at {:.0} packets/sec. ", pps));
+    } else if pps > 30.0 {
+        narrative.push_str(&format!("Traffic is moderate at {:.1} packets/sec. ", pps));
+    }
+
+    // Risk summary
+    let has_c2 = findings.iter().any(|f| f.kind == FindingKind::C2Beacon);
+    let has_exfil = findings.iter().any(|f| f.kind == FindingKind::DataExfil);
+    let has_scan = findings.iter().any(|f| f.kind == FindingKind::Scanner || f.kind == FindingKind::NetworkRecon);
+    let has_lateral = findings.iter().any(|f| f.kind == FindingKind::LateralMovement);
+
+    if has_c2 || has_exfil || has_scan || has_lateral {
+        narrative.push_str("⚠ This device shows suspicious behavior: ");
+        let mut flags = Vec::new();
+        if has_c2 { flags.push("C2 beaconing"); }
+        if has_exfil { flags.push("data exfiltration"); }
+        if has_scan { flags.push("scanning"); }
+        if has_lateral { flags.push("lateral movement"); }
+        narrative.push_str(&format!("{}. ", flags.join(", ")));
+    }
+
+    // Temporal context
+    if !temporal.is_empty() {
+        narrative.push_str(&format!("{}.", temporal));
+    }
+
+    narrative
 }
 
 pub fn print_profile(profile: &IpProfile) {

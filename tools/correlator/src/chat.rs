@@ -13,7 +13,7 @@ use crate::tools::{ToolCall, ask_permission, execute_tool_call};
 use crate::search::search_execute;
 use super::BELIEFS;
 
-pub fn run_chat(db_path: &Path, model: &str, live_mode: bool) {
+pub fn run_chat(db_path: &Path, model: &str, live_mode: bool, stealth_level: u8) {
     println!("\n═══════ NETWORK INTELLIGENCE ═══════");
 
     let ollama = OllamaClient::new(model);
@@ -47,7 +47,7 @@ pub fn run_chat(db_path: &Path, model: &str, live_mode: bool) {
 
     let scanner_beliefs = beliefs.clone();
     let (scanner_tx, scanner_rx) = std::sync::mpsc::channel::<ScannerEvent>();
-    let _scanner_thread = start_scanner(scanner_beliefs, scanner_tx, config.interface.clone());
+    let _scanner_thread = start_scanner(scanner_beliefs, scanner_tx, config.interface.clone(), stealth_level);
 
     let belief_context = {
         let sys = beliefs.lock().unwrap();

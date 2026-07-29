@@ -3,7 +3,7 @@ use std::path::Path;
 
 use rusqlite::Connection;
 
-use crate::correlate::{Correlator, Finding, IpProfile, load_from_db};
+use crate::correlate::{Correlator, Finding, IpProfile, load_from_db, generate_behavioral_summaries, BehavioralSummary};
 use crate::db::{init_db, upsert_device};
 
 pub struct NetworkContext {
@@ -12,6 +12,7 @@ pub struct NetworkContext {
     pub profiles: HashMap<String, IpProfile>,
     pub cross_ref: String,
     pub packet_count: usize,
+    pub behavioral_summaries: Vec<BehavioralSummary>,
 }
 
 pub fn build_network_context(db_path: &Path) -> NetworkContext {
@@ -34,6 +35,7 @@ pub fn build_network_context(db_path: &Path) -> NetworkContext {
     correlator.ingest_batch(packets);
     let findings = correlator.correlate_with_devices(&devices);
     let cross_ref = correlator.cross_reference(&devices);
+    let behavioral_summaries = generate_behavioral_summaries(&mut correlator, &devices);
 
     eprintln!(" done ({} IPs, {} findings)", correlator.profiles().len(), findings.len());
 
@@ -43,110 +45,79 @@ pub fn build_network_context(db_path: &Path) -> NetworkContext {
         profiles: correlator.profiles().clone(),
         cross_ref,
         packet_count: total as usize,
+        behavioral_summaries,
     }
 }
 
 pub fn format_context_for_ai(ctx: &NetworkContext) -> String {
     let mut parts = Vec::new();
 
-    parts.push(
-        "## Labels\n\
-         BOT/C2_BEACON/BEACON = periodic/suspicious outbound. IOT/PRINTER_IOT = IoT. \
-         SCANNER/NET_RECON/LATERAL_MOVEMENT = probing. DATA_EXFIL = heavy outbound. \
-         BROWSER/STREAMING/CLOUD_SYNC/VPN/TOR/GAME/SERVER = normal roles. \
-         Confidence 0-100 from detector signals."
-            .to_string(),
-    );
+    let total_dns: usize = ctx.profiles.values().map(|p| p.dns_domains.len()).sum();
+    parts.push(format!(
+        "## Overview\n{} packets, {} IPs, {} DNS domains, {} findings, {} devices",
+        ctx.packet_count, ctx.profiles.len(), total_dns, ctx.findings.len(), ctx.devices.len(),
+    ));
 
-    if !ctx.devices.is_empty() {
+    // ── Behavioral Narratives — the core intelligence ──
+    if !ctx.behavioral_summaries.is_empty() {
         parts.push(format!(
-            "## Devices ({})\n{}",
-            ctx.devices.len(),
-            ctx.devices
-                .iter()
-                .map(|(ip, _mac, hostname, _vendor, os, ports)| {
-                    format!(
-                        "{} | {} | {} | {}",
-                        ip,
-                        hostname.as_deref().unwrap_or("?"),
-                        os.as_deref().unwrap_or("?"),
-                        if ports.is_empty() { "no ports" } else { ports }
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
+            "## What Each Device Is Doing\n\
+             This is the behavioral analysis. Each device is described by what it's actually doing on the network.\n\n{}",
+            ctx.behavioral_summaries.iter().map(|s| s.to_string()).collect::<Vec<_>>().join("\n")
         ));
     }
 
-    let total_dns: usize = ctx.profiles.values().map(|p| p.dns_domains.len()).sum();
-    parts.push(format!(
-        "## Stats\n{} packets, {} IPs, {} DNS domains, {} findings",
-        ctx.packet_count,
-        ctx.profiles.len(),
-        total_dns,
-        ctx.findings.len()
-    ));
+    // ── Findings with context ──
+    if !ctx.findings.is_empty() {
+        let mut findings = ctx.findings.clone();
+        findings.sort_by(|a, b| {
+            b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        parts.push(format!(
+            "## Anomaly Signals\n\
+             These are the detector findings. Each is a signal — cross-reference with behavioral narratives above.\n{}",
+            findings.iter().take(20).map(|f| {
+                let detail = if f.detail.len() > 150 {
+                    format!("{}…", &f.detail[..150])
+                } else {
+                    f.detail.clone()
+                };
+                format!("  {} [{}] {}%: {}", f.ip, f.kind, (f.confidence * 100.0) as u32, detail)
+            }).collect::<Vec<_>>().join("\n")
+        ));
+    }
 
+    // ── Top Talkers with richer detail ──
     let mut profiles: Vec<_> = ctx.profiles.values().collect();
     profiles.sort_by(|a, b| b.packet_count.cmp(&a.packet_count));
     if !profiles.is_empty() {
         parts.push(format!(
-            "## Top Talkers\n{}",
-            profiles
-                .iter()
-                .take(12)
-                .map(|p| {
-                    let dns = if p.dns_domains.is_empty() {
-                        String::new()
-                    } else {
-                        format!(
-                            ", dns:{}",
-                            p.dns_domains
-                                .keys()
-                                .take(2)
-                                .cloned()
-                                .collect::<Vec<_>>()
-                                .join(",")
-                        )
-                    };
-                    format!(
-                        "{}: {} pkts (↑{} ↓{}){}",
-                        p.ip, p.packet_count, p.outbound_count, p.inbound_count, dns
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
+            "## Top Talkers (raw stats)\n{}",
+            profiles.iter().take(15).map(|p| {
+                let duration = p.last_seen - p.first_seen;
+                let pps = if duration > 0.0 { p.packet_count as f64 / duration } else { 0.0 };
+                let domains = if p.dns_domains.is_empty() { String::new() } else {
+                    let mut d: Vec<_> = p.dns_domains.iter().collect();
+                    d.sort_by(|a, b| b.1.cmp(a.1));
+                    format!(", top domains: {}", d.iter().take(3).map(|(d, c)| format!("{}({})", d, c)).collect::<Vec<_>>().join(", "))
+                };
+                let ports = if p.dest_ports.is_empty() { String::new() } else {
+                    let mut pp: Vec<_> = p.dest_ports.iter().collect();
+                    pp.sort_by(|a, b| b.1.cmp(a.1));
+                    format!(", top ports: {}", pp.iter().take(3).map(|(p, c)| format!("{}/{}", p, c)).collect::<Vec<_>>().join(", "))
+                };
+                format!("  {}: {} pkts ({}↑ {}↓, {:.1}s, {:.1} pps){}{}",
+                    p.ip, p.packet_count, p.outbound_count, p.inbound_count, duration, pps, domains, ports)
+            }).collect::<Vec<_>>().join("\n")
         ));
     }
 
-    if !ctx.findings.is_empty() {
-        let mut findings = ctx.findings.clone();
-        findings.sort_by(|a, b| {
-            b.confidence
-                .partial_cmp(&a.confidence)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+    // ── Cross-Reference Analysis ──
+    if !ctx.cross_ref.is_empty() {
         parts.push(format!(
-            "## Findings (top by confidence)\n{}",
-            findings
-                .iter()
-                .take(15)
-                .map(|f| {
-                    let detail = if f.detail.len() > 120 {
-                        format!("{}…", &f.detail[..120])
-                    } else {
-                        f.detail.clone()
-                    };
-                    format!(
-                        "{} [{}] {}%: {}",
-                        f.ip,
-                        f.kind,
-                        (f.confidence * 100.0) as u32,
-                        detail
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
+            "## Cross-Reference (nmap ↔ traffic)\n\
+             Matches devices discovered by nmap with their traffic behavior.\n{}",
+            ctx.cross_ref
         ));
     }
 

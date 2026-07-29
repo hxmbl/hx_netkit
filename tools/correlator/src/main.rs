@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 mod config;
+mod constants;
 mod db;
 mod tshark;
 mod tools;
@@ -73,6 +74,9 @@ enum Commands {
         no_tshark: bool,
         #[arg(long)]
         debug: bool,
+        /// Stealth level: 0=passive (TShark only), 1=light (rate-limited scan), 2=full (default)
+        #[arg(long, default_value_t = 2)]
+        stealth_level: u8,
     },
 
     /// Chat with AI about captured network data
@@ -81,6 +85,9 @@ enum Commands {
         db: Option<PathBuf>,
         #[arg(long)]
         model: Option<String>,
+        /// Stealth level: 0=passive, 1=light, 2=full (default)
+        #[arg(long, default_value_t = 2)]
+        stealth_level: u8,
     },
 
     /// Run nmap scan only
@@ -322,13 +329,13 @@ fn main() {
             let mdl = resolve_model(model.as_deref(), &config);
             live::run_live_interpret(iface, dur, no_save, output.as_deref(), verbose, ai, mdl);
         }
-        Commands::Capture { interface, target, duration, no_save, output, fast, no_nmap, no_tshark, debug } => {
+        Commands::Capture { interface, target, duration, no_save, output, fast, no_nmap, no_tshark, debug, stealth_level } => {
             let iface = interface.as_deref().unwrap_or(&config.interface);
             let tgt = target.as_deref().unwrap_or(&config.target);
             let dur = duration.unwrap_or(config.duration);
-            capture::run_capture(iface, tgt, dur, no_save, output.as_deref(), fast, no_nmap, no_tshark, debug);
+            capture::run_capture(iface, tgt, dur, no_save, output.as_deref(), fast, no_nmap, no_tshark, debug, stealth_level);
         }
-        Commands::Chat { db, model } => {
+        Commands::Chat { db, model, stealth_level } => {
             let db_path = db.unwrap_or_else(|| {
                 let dir = config::dirs();
                 let mut entries: Vec<_> = std::fs::read_dir(&dir).unwrap()
@@ -346,7 +353,7 @@ fn main() {
                 println!("[System] AI disabled in config. Entering search mode.");
                 search::run_search(&db_path, None);
             } else {
-                chat::run_chat(&db_path, mdl, false);
+                chat::run_chat(&db_path, mdl, false, stealth_level);
             }
         }
         Commands::Scan { target, output } => {

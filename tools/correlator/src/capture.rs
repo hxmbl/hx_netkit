@@ -5,16 +5,22 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::params;
 
+use crate::constants;
 use crate::db::{init_db, default_db_path};
 use crate::context::parse_nmap_xml;
 use crate::tools::sudo_cmd;
 use crate::tshark::{extract_fields, tshark_args};
 
 pub fn run_capture(interface: &str, target: &str, duration: u64, no_save: bool, output: Option<&Path>,
-                   fast: bool, no_nmap: bool, no_tshark: bool, debug: bool) {
+                   fast: bool, no_nmap: bool, no_tshark: bool, debug: bool, stealth_level: u8) {
     let db_path = default_db_path(no_save, output);
     println!("═══════ CAPTURE ═══════");
     println!("[System] Database: {}", db_path.display());
+    println!("[System] Stealth level: {} ({})", stealth_level, match stealth_level {
+        0 => "passive — TShark only, no scanning",
+        1 => "light — rate-limited scan",
+        _ => "full — standard scan",
+    });
 
     let conn = init_db(&db_path);
     let conn = Arc::new(Mutex::new(conn));
@@ -31,13 +37,10 @@ pub fn run_capture(interface: &str, target: &str, duration: u64, no_save: bool, 
         None
     };
 
-    if !no_nmap {
+    if !no_nmap && stealth_level > constants::STEALTH_PASSIVE {
         println!("[System] Starting nmap scan of {}...", target);
-        let args = if fast {
-            vec!["-sS", "--top-ports", "100", "--open", "-oX", "-", "-T4", "--min-rate", "1000", target]
-        } else {
-            vec!["-sV", "-O", "-sC", "--open", "-oX", "-", "-T4", target]
-        };
+        let mut args: Vec<&str> = constants::nmap_flags(stealth_level, fast).to_vec();
+        args.push(target);
 
         let output = sudo_cmd("nmap").args(&args)
             .stdin(std::process::Stdio::inherit())

@@ -416,9 +416,14 @@ pub fn start_scanner(
     beliefs: Arc<Mutex<BeliefSystem>>,
     tx: mpsc::Sender<ScannerEvent>,
     _interface: String,
+    stealth_level: u8,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        let interval = std::time::Duration::from_secs(4);
+        use crate::constants;
+        if !constants::background_scanner_enabled(stealth_level) {
+            return;
+        }
+        let interval = std::time::Duration::from_secs(constants::background_scanner_interval(stealth_level));
         loop {
             std::thread::sleep(interval);
 

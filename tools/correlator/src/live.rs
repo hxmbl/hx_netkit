@@ -246,7 +246,7 @@ pub fn run_live_interpret(interface: &str, duration: u64, no_save: bool, output:
             }
         });
 
-        crate::chat::run_chat(&db_path, model, true);
+        crate::chat::run_chat(&db_path, model, true, 2);
 
         let _ = child.kill();
         let _ = reader_handle.join();
