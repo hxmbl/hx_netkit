@@ -1,9 +1,9 @@
 use std::collections::HashMap;
-use std::process::Command;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use crate::correlate::{Finding, FindingKind};
+use crate::tools::sudo_cmd;
 
 // ── Belief Categories ──
 
@@ -321,21 +321,6 @@ fn finding_kind_to_category(kind: &FindingKind) -> BeliefCategory {
         FindingKind::VPN | FindingKind::Tor | FindingKind::IoTCoordinator | FindingKind::Unknown => {
             BeliefCategory::Unknown
         }
-    }
-}
-
-fn sudo_cmd(prog: &str) -> Command {
-    let output = Command::new("id").arg("-u").output().ok();
-    let is_root = output
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim() == "0")
-        .unwrap_or(false);
-    if is_root {
-        Command::new(prog)
-    } else {
-        let mut c = Command::new("sudo");
-        c.arg(prog);
-        c
     }
 }
 

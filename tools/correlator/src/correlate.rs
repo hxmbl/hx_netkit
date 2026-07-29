@@ -184,18 +184,7 @@ fn shannon_entropy(values: &[u32]) -> f64 {
         .sum()
 }
 
-fn shannon_entropy_u64(values: &[u64]) -> f64 {
-    if values.is_empty() { return 0.0; }
-    let total = values.len() as f64;
-    let mut freq: HashMap<u64, u64> = HashMap::new();
-    for &v in values { *freq.entry(v).or_insert(0) += 1; }
-    freq.values()
-        .map(|&count| {
-            let p = count as f64 / total;
-            -p * p.log2()
-        })
-        .sum()
-}
+
 
 impl IpProfile {
     fn new(ip: &str) -> Self {
@@ -310,7 +299,8 @@ impl IpProfile {
             self.avg_packet_size = old_avg + (len as f64 - old_avg) / n;
             if n > 1.0 {
                 let old_var = self.packet_size_variance;
-                self.packet_size_variance = ((n - 2.0) * old_var + (len as f64 - old_avg) * (len as f64 - self.avg_packet_size)) / (n - 1.0);
+                let new_var = ((n - 2.0) * old_var + (len as f64 - old_avg) * (len as f64 - self.avg_packet_size)) / (n - 1.0);
+                self.packet_size_variance = new_var.max(0.0);
             }
             if is_src {
                 self.outbound_bytes += len as u64;
@@ -410,9 +400,9 @@ const GAME_PORTS: &[u32] = &[
     3478, 3479, 3480, // PlayStation
     3074, // Xbox
     6112, 6113, 6114, 6115, // Battle.net
-    1119, 1120, 3724, 6113, // Blizzard
+    1119, 1120, 3724, // Blizzard
     25565, 25566, 19132, 19133, // Minecraft
-    7777, 27015, // Unreal Engine
+    7777, // Unreal Engine
 ];
 
 const TOR_PORTS: &[u32] = &[9001, 9002, 9003, 9030, 9031, 9150, 443];
@@ -1601,11 +1591,19 @@ impl RealtimeEngine {
 pub struct OllamaClient {
     base_url: String,
     model: String,
+    num_ctx: u32,
 }
 
 impl OllamaClient {
     pub fn new(model: &str) -> Self {
-        Self { base_url: "http://localhost:11434".into(), model: model.to_string() }
+        let config = crate::load_config();
+        let base_url = config
+            .ollama_url
+            .filter(|u| !u.trim().is_empty())
+            .unwrap_or_else(|| "http://localhost:11434".into());
+        // Cap aggressively on small machines — Ollama will still allocate KV for num_ctx.
+        let num_ctx = config.num_ctx.clamp(2048, 32768);
+        Self { base_url, model: model.to_string(), num_ctx }
     }
 
     pub fn is_available(&self) -> bool {
@@ -1614,24 +1612,24 @@ impl OllamaClient {
             .unwrap_or(false)
     }
 
-    /// Try to start Ollama in the background. Returns true if started successfully.
-    pub fn try_start() -> bool {
+    /// Try to start a *local* Ollama in the background. No-op for remote URLs.
+    pub fn try_start(&self) -> bool {
         use std::process::Command;
-        // Check if already running
-        if reqwest::blocking::get("http://localhost:11434/api/tags").map(|r| r.status().is_success()).unwrap_or(false) {
+        if self.is_available() {
             return true;
         }
-        // Try launching ollama serve in background
-        let _ = Command::new("ollama").arg("serve")
+        let local = self.base_url.contains("localhost") || self.base_url.contains("127.0.0.1");
+        if !local {
+            return false;
+        }
+        let _ = Command::new("ollama")
+            .arg("serve")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn();
-        // Wait up to 5 seconds for it to come up
         for _ in 0..10 {
             std::thread::sleep(std::time::Duration::from_millis(500));
-            if reqwest::blocking::get("http://localhost:11434/api/tags")
-                .map(|r| r.status().is_success())
-                .unwrap_or(false) {
+            if self.is_available() {
                 return true;
             }
         }
@@ -1651,8 +1649,8 @@ impl OllamaClient {
             "stream": true,
             "options": {
                 "temperature": 0.3,
-                "num_predict": 4096,
-                "num_ctx": 8192,
+                "num_predict": 2048,
+                "num_ctx": self.num_ctx,
             }
         });
 
@@ -1660,6 +1658,20 @@ impl OllamaClient {
             .json(&body)
             .send()
             .map_err(|e| e.to_string())?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().unwrap_or_default();
+            let detail = serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(|s| s.to_string()))
+                .filter(|s| !s.is_empty())
+                .unwrap_or(body);
+            return Err(format!(
+                "Ollama at {} rejected model '{}': {} ({})",
+                self.base_url, self.model, detail, status
+            ));
+        }
 
         use std::io::{BufRead, Write};
         let mut content = String::new();
@@ -1671,7 +1683,14 @@ impl OllamaClient {
             match reader.read_line(&mut buf) {
                 Ok(0) => break,
                 Ok(_) => {
-                    if let Ok(chunk) = serde_json::from_str::<Value>(&buf) {
+                    let line = buf.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if let Ok(chunk) = serde_json::from_str::<Value>(line) {
+                        if let Some(err) = chunk.get("error").and_then(|e| e.as_str()) {
+                            return Err(format!("Ollama error: {}", err));
+                        }
                         if let Some(msg) = chunk.get("message") {
                             if let Some(c) = msg.get("content").and_then(|v| v.as_str()) {
                                 if !c.is_empty() {
