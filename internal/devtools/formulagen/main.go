@@ -27,24 +27,21 @@ const template = `# frozen_string_literal: true
 class Correlator < Formula
   desc "Network intelligence — scan, capture, and interrogate your network with local AI"
   homepage "https://github.com/hxmbl/hx_netkit"
-  version "{{VERSION}}"
   license "Unlicense"
+
+  livecheck do
+    url :homepage
+    regex(/^v(\d+(?:\.\d+)+)$/i)
+    strategy :github_latest
+  end
 
   on_macos do
     if Hardware::CPU.arm?
       url "https://github.com/hxmbl/hx_netkit/releases/download/{{TAG}}/correlator-{{TAG}}-darwin-arm64.tar.gz"
       sha256 "{{DARWIN_ARM64}}"
-
-      def install
-        bin.install "correlator"
-      end
     else
       url "https://github.com/hxmbl/hx_netkit/releases/download/{{TAG}}/correlator-{{TAG}}-darwin-amd64.tar.gz"
       sha256 "{{DARWIN_AMD64}}"
-
-      def install
-        bin.install "correlator"
-      end
     end
   end
 
@@ -52,18 +49,14 @@ class Correlator < Formula
     if Hardware::CPU.arm? && Hardware::CPU.is_64_bit?
       url "https://github.com/hxmbl/hx_netkit/releases/download/{{TAG}}/correlator-{{TAG}}-linux-arm64.tar.gz"
       sha256 "{{LINUX_ARM64}}"
-
-      def install
-        bin.install "correlator"
-      end
     else
       url "https://github.com/hxmbl/hx_netkit/releases/download/{{TAG}}/correlator-{{TAG}}-linux-amd64.tar.gz"
       sha256 "{{LINUX_AMD64}}"
-
-      def install
-        bin.install "correlator"
-      end
     end
+  end
+
+  def install
+    bin.install "correlator"
   end
 
   def caveats
@@ -88,7 +81,7 @@ func sha256File(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
 		return "", err
