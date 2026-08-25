@@ -1,0 +1,25 @@
+# Example correlator configuration.
+# Copy to correlator.toml (cwd) or ~/.correlator/config.toml.
+
+interface = "en1"                 # capture interface
+target    = "192.168.1.0/24"      # nmap target
+duration  = 300                   # capture seconds
+
+model      = "qwen3:4b"           # top-level model override (wins over [ai].model when customized)
+ollama_url = "http://localhost:11434"
+num_ctx    = 12288                # Ollama context window; clamped to 2048..32768
+
+corporate_mode = false            # true = hide game/streaming/cloud-sync detectors
+
+[ai]
+model   = "qwen3:4b"
+enabled = true                    # false forces non-AI search mode in `chat`
+
+[web]
+# OFFLINE BY DEFAULT. Internet access for AI tools requires explicit consent:
+# enable here, or pass --allow-web to `chat` for one session.
+enabled      = false
+provider     = "duckduckgo"       # duckduckgo | searxng | brave | tavily
+# searxng_url     = "http://localhost:8888"   # self-hosted SearXNG JSON API
+# brave_api_key   = "your-key"                # https://brave.com/search/api/
+# tavily_api_key  = "your-key"                # https://tavily.com

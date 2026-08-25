@@ -3,34 +3,40 @@ name: ci
 on:
   push:
     branches: [main]
-    paths:
-      - "tools/correlator/**"
-      - ".github/workflows/ci.yml"
   pull_request:
-    branches: [main]
-    paths:
-      - "tools/correlator/**"
-      - ".github/workflows/ci.yml"
+
+permissions:
+  contents: read
 
 jobs:
   test:
+    name: Test (${{ matrix.os }})
     strategy:
       matrix:
-        os: [macos-latest, ubuntu-latest]
+        os: [ubuntu-24.04, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-go@v5
         with:
-          workspaces: tools/correlator
+          go-version-file: go.mod
+          cache: true
 
-      - name: Run tests
-        working-directory: tools/correlator
-        run: cargo test --verbose
+      - name: Verify formatting
+        if: runner.os == 'Linux'
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed on: $unformatted"
+            exit 1
+          fi
 
-      - name: Check warnings
-        working-directory: tools/correlator
-        run: cargo build 2>&1 | grep -i warning && exit 1 || true
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test (race)
+        run: go test -race -count=1 ./...
+
+      - name: Build all
+        run: go build ./...

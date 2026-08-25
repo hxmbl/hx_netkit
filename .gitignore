@@ -1,5 +1,7 @@
-# Rust
-target/
+# Go
+correlator
+*.test
+*.out
 
 # IDE
 .vscode/
@@ -12,9 +14,6 @@ target/
 .DS_Store
 Thumbs.db
 
-# Config with secrets
-opencode.json
-
 # Env files
 .env
 .env.*
@@ -22,6 +21,8 @@ opencode.json
 # Temp/test databases
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
 
 # Capture files
 *.pcap
