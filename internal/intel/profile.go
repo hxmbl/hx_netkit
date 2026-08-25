@@ -371,19 +371,6 @@ func ShannonEntropy(values []uint32) float64 {
 	return e
 }
 
-func shannonEntropy(m map[uint32]uint64) float64 {
-	if len(m) == 0 {
-		return 0
-	}
-	total := float64(len(m))
-	e := 0.0
-	for _, c := range m {
-		pr := float64(c) / total
-		e -= pr * math.Log2(pr)
-	}
-	return e
-}
-
 // ExtractDomain reduces an FQDN to its registrable two-label suffix.
 func ExtractDomain(fqdn string) string {
 	labels := strings.Split(strings.TrimSuffix(fqdn, "."), ".")

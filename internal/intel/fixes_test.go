@@ -43,8 +43,10 @@ func TestFindingOrderDeterministic(t *testing.T) {
 		}
 		return b.String()
 	}
-	if run() != run() {
-		t.Error("correlate ordering unstable across identical runs")
+	first := run()
+	second := run()
+	if first != second {
+		t.Errorf("correlate ordering unstable across identical runs:\n%s\n---\n%s", first, second)
 	}
 }
 

@@ -139,7 +139,8 @@ func ValidTarget(target string) bool {
 		return false
 	}
 	for _, c := range target {
-		if !(c >= '0' && c <= '9' || c == '.' || c == ',' || c == '-' || c == ' ') {
+		isDigit := c >= '0' && c <= '9'
+		if !isDigit && c != '.' && c != ',' && c != '-' && c != ' ' {
 			return false
 		}
 	}

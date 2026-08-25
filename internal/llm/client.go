@@ -164,7 +164,7 @@ func (c *Client) Chat(ctx context.Context, messages []Message, tools []map[strin
 		if json.Unmarshal(raw, &errBody) == nil && errBody.Error != "" {
 			detail = errBody.Error
 		}
-		return nil, fmt.Errorf("Ollama at %s rejected model '%s': %s (%d)",
+		return nil, fmt.Errorf("ollama at %s rejected model '%s': %s (%d)",
 			c.BaseURL, c.Model, detail, resp.StatusCode)
 	}
 
@@ -189,7 +189,7 @@ func (c *Client) Chat(ctx context.Context, messages []Message, tools []map[strin
 			}
 			if jerr := json.Unmarshal([]byte(trimmed), &chunk); jerr == nil {
 				if chunk.Error != "" {
-					return nil, fmt.Errorf("Ollama error: %s", chunk.Error)
+					return nil, fmt.Errorf("ollama error: %s", chunk.Error)
 				}
 				if chunk.Message.Content != "" {
 					out.Content += chunk.Message.Content

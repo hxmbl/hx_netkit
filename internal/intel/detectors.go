@@ -119,11 +119,6 @@ var browserDomains = []string{
 	"reddit.com", "redditstatic.com", "discord.com", "discordapp.com",
 }
 
-var cdnDomains = []string{
-	"akamai.net", "akamaized.net", "cloudfront.net", "fastly.net",
-	"cloudflare.com", "azureedge.net", "edgecastcdn.net", "cdn",
-}
-
 var cloudDomains = []string{
 	"icloud.com", "apple.com", "googleapis.com", "drive.google.com",
 	"dropbox.com", "onedrive.live.com", "box.com", "sync", "backup",

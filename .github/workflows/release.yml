@@ -54,3 +54,49 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ env.ARCHIVE }}
+
+  homebrew:
+    name: Update Homebrew tap
+    needs: [release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download release artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          mkdir dist
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" \
+            --pattern 'correlator-*-*.tar.gz' --dir dist --clobber
+          ls -la dist
+
+      - name: Generate formula
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          go run ./internal/devtools/formulagen -version "$VERSION" -dist ./dist -out Formula/correlator.rb
+
+      - name: Push to tap (needs secret TAP_TOKEN)
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "::warning::Secret TAP_TOKEN not set — skipping tap update. Add a classic PAT with repo scope on hxmbl/homebrew-tap as the TAP_TOKEN secret to enable this."
+            exit 0
+          fi
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/hxmbl/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          cp Formula/correlator.rb tap/Formula/correlator.rb
+          cd tap
+          git config user.name  "correlator-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add Formula/correlator.rb
+          git commit -m "correlator ${TAG}"
+          git push origin HEAD:main

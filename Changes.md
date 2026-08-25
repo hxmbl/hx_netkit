@@ -1,5 +1,42 @@
 # Changes
 
+## v2.1.0 — UX release
+
+Four-phase usability overhaul.
+
+**First run & diagnostics**
+- `correlator doctor`: verifies tshark/nmap, lists capture-capable
+  interfaces with addresses, checks Ollama reachability and whether the
+  configured model is pulled, disk space, privileges — every failure
+  carries a fix-it hint.
+- `correlator init`: interactive wizard that detects your interface,
+  derives the scan CIDR, and writes a commented correlator.toml.
+- Captures now update a `latest.db` symlink, so `analyze` / `chat` /
+  `ask` work with no `-d` flag; capture completion prints next steps.
+- Root help gained worked examples; shell completions advertised.
+
+**Output polish**
+- Severity-coded findings (critical=red, warning=amber, benign=blue)
+  with confidence bars; auto-disabled when piped (`NO_COLOR` respected).
+- `analyze --min-confidence N --top N --kind threat|benign|SCANNER,…`
+  plus `--json`.
+- Live capture progress meter: packet count, MB, packets/sec, elapsed
+  vs remaining.
+- Ctrl-C during capture stops tshark gracefully — partial captures are
+  finalized and summarized instead of lost.
+
+**Interactive REPL**
+- readline-backed chat/search: arrow-key history (~/.correlator/),
+  tab completion over slash commands and discovered device IPs.
+- Ctrl-C cancels the current line; Ctrl-D quits.
+- `/help` now shows session help (it previously leaked search help).
+
+**One-command flow**
+- `correlator run`: doctor gate → interface/target/duration prompts →
+  capture → styled findings → optional AI chat hand-off.
+- `correlator captures list|info|prune` — dates, sizes, packet counts;
+  prune supports --keep/--older-than/--yes with a dry-run preview.
+
 ## v2.0.1
 
 Hardening release — fixes from a full security and quality audit.

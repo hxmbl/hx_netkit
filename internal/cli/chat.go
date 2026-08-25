@@ -114,7 +114,9 @@ Use get_beliefs tool to query current state.`,
 	if webClient != nil {
 		fmt.Printf(", webfetch, websearch (--allow-web; provider: %s)", webClient.ProviderName())
 	}
-	fmt.Printf("\n[System] Belief tracker: scanning %d IPs in background (use /beliefs to see)\n\n", beliefs.Len())
+	fmt.Printf("\n[System] Belief tracker: scanning %d IPs in background (use /beliefs to see)\n", beliefs.Len())
+	fmt.Println("[System] Type /help for commands. Ctrl-C cancels a line; Ctrl-D quits.")
+	fmt.Println()
 
 	// ONE buffered reader owns stdin; both the chat loop and the tool
 	// permission prompter draw from it sequentially. Two independent
@@ -127,6 +129,7 @@ Use get_beliefs tool to query current state.`,
 		Beliefs:   beliefs,
 		Events:    scanner,
 		Prompter:  prompterFor(opts.AutoYes, stdin),
+		Editor:    newEditorIfTTY(func() (llm.LineEditor, error) { return newChatEditor(db) }),
 		SystemPmt: systemPrompt,
 		In:        stdin,
 		Out:       os.Stdout,
@@ -143,6 +146,19 @@ func prompterFor(autoYes bool, in *bufio.Reader) llm.Prompter {
 		return llm.AlwaysAllow{}
 	}
 	return &cliPrompter{in: in}
+}
+
+// newEditorIfTTY constructs an interactive line editor only when stdin is a
+// terminal; piped input keeps the plain buffered path (and tests keep working).
+func newEditorIfTTY(make func() (llm.LineEditor, error)) llm.LineEditor {
+	if !isTerminal(os.Stdin) {
+		return nil
+	}
+	ed, err := make()
+	if err != nil {
+		return nil // readline unavailable — degrade silently
+	}
+	return ed
 }
 
 // ── live interpret ──────────────────────────────────────────────────────────

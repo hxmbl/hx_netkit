@@ -1,0 +1,16 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard
+  exclusions:
+    rules:
+      # CLI tool: display writes and best-effort cleanup don't warrant
+      # explicit error handling at every call site.
+      - path: (.+)\.go
+        text: "Error return value of `(fmt\\.Fprint|fmt\\.Fprintln|fmt\\.Fprintf|w\\.Write|w\\.Flush|resp\\.Body\\.Close|rows\\.Close|stmt\\.Close|rs\\.Close|handle\\.Close|db\\.Close|db2\\.Close|raw\\.Close|outRows\\.Close|inRows\\.Close|ed\\.Close|os\\.Remove|os\\.MkdirAll|os\\.WriteFile|os\\.Symlink|io\\.Copy|resp\\.WriteString)` is not checked"
+      - path: _test\.go
+        linters:
+          - errcheck

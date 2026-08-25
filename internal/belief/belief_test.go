@@ -102,7 +102,7 @@ func TestUpdateFromNmapIotPorts(t *testing.T) {
 	s.Ensure("192.168.1.60")
 	s.UpdateFromNmap("192.168.1.60", true, []uint32{5353, 5683})
 	b, _ := s.Get("192.168.1.60")
-	if b.MaxCat != IoT && !(b.MaxCat == Unknown) {
+	if b.MaxCat != IoT && b.MaxCat != Unknown {
 		t.Logf("max cat = %s (IoT boost may be diluted by prior)", b.MaxCat)
 	}
 	cleanBefore := b.Dist[IoT]

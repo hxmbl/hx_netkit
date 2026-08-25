@@ -361,6 +361,24 @@ func CapturePath(noSave bool, output string) string {
 	return filepath.Join(dir, name)
 }
 
+// UpdateLatestSymlink points ~/.correlator/captures/latest.db at path so
+// flag-less commands (chat, analyze, …) pick the newest capture. Silently
+// no-ops when path lives outside the captures directory.
+func UpdateLatestSymlink(path string) {
+	dir := config.CapturesDir()
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return
+	}
+	absDir, err := filepath.Abs(dir)
+	if err != nil || !strings.HasPrefix(absPath, absDir+string(filepath.Separator)) {
+		return
+	}
+	link := filepath.Join(dir, "latest.db")
+	os.Remove(link)
+	_ = os.Symlink(absPath, link)
+}
+
 // QueryRows executes arbitrary SQL and renders results as columns + rows of
 // strings. Only used by the query command / sql tool after validation.
 func (d *DB) QueryRows(sqlText string, limit int) (cols []string, rows [][]string, err error) {

@@ -4,17 +4,21 @@ package capture
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/hxmbl/hx_netkit/internal/nmap"
 	"github.com/hxmbl/hx_netkit/internal/store"
 	"github.com/hxmbl/hx_netkit/internal/tshark"
+	"github.com/hxmbl/hx_netkit/internal/ui"
 )
 
 // Options configures one capture run.
@@ -28,7 +32,8 @@ type Options struct {
 	Debug        bool
 	StealthLevel uint8
 	DBPath       string
-	Out          io.Writer // progress output; os.Stdout by default
+	Color        bool // styled output (defaults to plain)
+	Out          io.Writer
 }
 
 func sudoCmd(prog string, args ...string) *exec.Cmd {
@@ -89,7 +94,11 @@ func Run(opts Options) (int, int, error) {
 				if tail := strings.TrimSpace(stderrBuf.String()); tail != "" {
 					msg += ": " + tail
 				}
-				fmt.Fprintf(out, "[Error] Failed to run nmap: %s. Is it installed?\n", msg)
+				hint := ""
+				if _, lookErr := exec.LookPath("nmap"); lookErr != nil {
+					hint = "\n[Hint] Install nmap first: brew install nmap (macOS) · apt install nmap (Debian/Ubuntu)"
+				}
+				fmt.Fprintf(out, "[Error] Failed to run nmap: %s.%s\n", msg, hint)
 				return
 			}
 			if len(xmlOut) == 0 {
@@ -98,10 +107,14 @@ func Run(opts Options) (int, int, error) {
 			now := float64(time.Now().UnixNano()) / 1e9
 			devices := nmap.ParseXML(xmlOut)
 			for _, d := range devices {
-				db.UpsertDevice(d.IP, d.MAC, d.Hostname, d.MACVendor, d.OSGuess, d.PortsString(), now)
+				if uerr := db.UpsertDevice(d.IP, d.MAC, d.Hostname, d.MACVendor, d.OSGuess, d.PortsString(), now); uerr != nil {
+					fmt.Fprintf(out, "[Warn] device upsert failed for %s: %v\n", d.IP, uerr)
+				}
 			}
 			summary := nmap.Summarize(devices)
-			db.RecordScan(opts.Target, string(xmlOut), summary, now)
+			if rerr := db.RecordScan(opts.Target, string(xmlOut), summary, now); rerr != nil {
+				fmt.Fprintf(out, "[Warn] scan record failed: %v\n", rerr)
+			}
 			fmt.Fprintf(out, "[nmap] Found %d devices:\n%s\n", len(devices), summary)
 		}()
 	} else {
@@ -125,7 +138,10 @@ func Run(opts Options) (int, int, error) {
 	fmt.Fprintf(out, "[System] %d packets captured, %d stored\n", stored, stored)
 	fmt.Fprintf(out, "[System] %d devices in database\n", devices)
 	fmt.Fprintf(out, "[System] Database saved at %s\n", opts.DBPath)
-	fmt.Fprintf(out, "[System] To chat: correlator chat -d %s\n", opts.DBPath)
+	store.UpdateLatestSymlink(opts.DBPath)
+	fmt.Fprintln(out, "[System] Next steps:")
+	fmt.Fprintf(out, "  correlator analyze          # behavioral findings for this capture\n")
+	fmt.Fprintf(out, "  correlator chat             # ask the local AI about it\n")
 	return stored, devices, nil
 }
 
@@ -153,23 +169,31 @@ func runTShark(db *store.DB, opts Options, out io.Writer) (int, error) {
 		return 0, fmt.Errorf("failed to start tshark: %s. Is it installed?", msg)
 	}
 
-	// Timer can be cancelled early when the stream ends on its own, so the
-	// goroutine never outlives the capture.
+	// Timer can be cancelled early when the stream ends on its own, and a
+	// Ctrl-C interrupts tshark gracefully instead of killing the process —
+	// the partial capture is finalized and summarized.
 	timerStop := make(chan struct{})
 	var timerOnce sync.Once
 	defer timerOnce.Do(func() { close(timerStop) })
+	sigCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
 	go func() {
 		select {
 		case <-time.After(time.Duration(opts.DurationSecs) * time.Second):
 			interrupt(cmd)
 		case <-timerStop:
+		case <-sigCtx.Done():
+			fmt.Fprintf(out, "\n[System] Ctrl-C — stopping capture early…\n")
+			interrupt(cmd)
+			timerOnce.Do(func() { close(timerStop) })
 		}
 	}()
 
 	count := 0
+	var totalBytes uint64
+	progress := ui.NewProgress(out, "[cap]", time.Duration(opts.DurationSecs)*time.Second)
 	scanner := bufio.NewScanner(stdoutPipe)
 	scanner.Buffer(make([]byte, 0, 256*1024), 1024*1024)
-	start := time.Now()
 	for scanner.Scan() {
 		rawLine := scanner.Text()
 		if tshark.Skippable(rawLine) {
@@ -180,6 +204,7 @@ func runTShark(db *store.DB, opts Options, out io.Writer) (int, error) {
 			continue
 		}
 		count++
+		totalBytes += uint64(pkt.FrameLen)
 		_ = db.InsertPacket(
 			pkt.Epoch, pkt.IPSrc, pkt.IPDst,
 			i64(pkt.TCPsrc), i64(pkt.TCPdst), i64(pkt.UDPsrc), i64(pkt.UDPdst),
@@ -188,17 +213,21 @@ func runTShark(db *store.DB, opts Options, out io.Writer) (int, error) {
 		if opts.Debug {
 			fmt.Fprintf(os.Stderr, "[debug] %s\n", rawLine)
 		}
-		if count%100 == 0 {
-			elapsed := int(time.Since(start).Seconds())
-			fmt.Fprintf(out, "\r\x1b[K  %d captured, %d stored, %ds elapsed  ", count, count, elapsed)
-		}
+		progress.MaybeRender(uint64(count), totalBytes)
 	}
+	progress.Finish()
 	kill(cmd)
 	wait(cmd)
 
 	if count == 0 {
 		if tail := strings.TrimSpace(stderrBuf.String()); tail != "" {
-			fmt.Fprintf(out, "\n[Warn] tshark produced no packets. stderr: %s\n", tail)
+			hint := "\n[Hint] If this is a permissions problem: run once with sudo, or grant dumpcap access"
+			if _, lookErr := exec.LookPath("tshark"); lookErr != nil {
+				hint = "\n[Hint] Install tshark first: brew install wireshark (macOS) · apt install tshark (Debian/Ubuntu)"
+			}
+			fmt.Fprintf(out, "\n[Warn] tshark produced no packets. stderr: %s%s\n", tail, hint)
+		} else {
+			fmt.Fprintln(out, "\n[Warn] No packets captured — was the interface idle? Try `correlator doctor`.")
 		}
 	}
 

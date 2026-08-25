@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -23,6 +24,7 @@ import (
 	"github.com/hxmbl/hx_netkit/internal/store"
 	"github.com/hxmbl/hx_netkit/internal/textutil"
 	"github.com/hxmbl/hx_netkit/internal/tools"
+	"github.com/hxmbl/hx_netkit/internal/ui"
 	"github.com/hxmbl/hx_netkit/internal/version"
 )
 
@@ -36,11 +38,20 @@ func NewRootCmd() *cobra.Command {
 		Long: "correlator scans, captures and interrogates your network.\n" +
 			"No cloud. No telemetry. AI runs locally via Ollama; internet access for the\n" +
 			"AI is opt-in via [web] config or --allow-web.",
+		Example: `  correlator run            # guided: capture → analyze → chat
+  correlator doctor         # verify tools, interfaces, Ollama, disk
+  correlator init           # write a correlator.toml interactively
+
+  correlator capture -i en0 -t 192.168.1.0/24
+  correlator analyze        # findings for the latest capture
+  correlator chat           # ask the local AI about it
+  correlator captures list  # browse saved captures`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
 
 	root.AddCommand(
+		newRunCmd(cfg),
 		newCaptureCmd(cfg),
 		newLiveInterpretCmd(cfg),
 		newChatCmd(cfg),
@@ -55,6 +66,9 @@ func NewRootCmd() *cobra.Command {
 		newTopTalkersCmd(),
 		newDevicesCmd(),
 		newListCmd(),
+		newCapturesCmd(cfg),
+		newDoctorCmd(cfg),
+		newInitCmd(cfg),
 		newVersionCmd(),
 	)
 	return root
@@ -208,33 +222,86 @@ func newChatCmd(cfg config.Config) *cobra.Command {
 func newAnalyzeCmd() *cobra.Command {
 	var dbPath string
 	var corporate bool
+	var minConf int
+	var top int
+	var kindFilter string
+	var asJSON bool
 	cmd := &cobra.Command{
 		Use:   "analyze",
 		Short: "Run behavioral detectors on a capture — no AI required",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			filter, err := ui.ParseKindFilter(kindFilter)
+			if err != nil {
+				return err
+			}
+			// Resolve "latest" up front so JSON output can name the database.
+			if dbPath == "" {
+				p, perr := config.LatestDB()
+				if perr != nil {
+					return fmt.Errorf("no captures found — run `correlator run` or `correlator capture`")
+				}
+				dbPath = p
+			}
 			db := mustDB(dbPath)
 			defer db.Close()
 			c, err := ctxpkg.Build(db, corporate)
 			if err != nil {
 				return err
 			}
-			fmt.Printf("═══ FINDINGS (%d packets, %d IPs) ═══\n", c.PacketCount, len(c.Profiles))
-			fmt.Print(intel.FormatFindings(c.Findings))
+			out := cmd.OutOrStdout()
+			if asJSON {
+				payload := struct {
+					Database  string                    `json:"database"`
+					Packets   int                       `json:"packets"`
+					IPs       int                       `json:"ips"`
+					Findings  []intel.Finding           `json:"findings"`
+					Summaries []intel.BehavioralSummary `json:"summaries,omitempty"`
+				}{
+					Database: dbPath,
+					Packets:  c.PacketCount,
+					IPs:      len(c.Profiles),
+					Findings: ui.FilterFindings(c.Findings, ui.FindingsOptions{
+						MinConfidencePc: minConf,
+						TopN:            top,
+						KindFilter:      filter,
+					}),
+					Summaries: c.Summaries,
+				}
+				enc := json.NewEncoder(out)
+				enc.SetIndent("", "  ")
+				return enc.Encode(payload)
+			}
+
+			color := false
+			if f, ok := out.(*os.File); ok {
+				color = isTerminal(f)
+			}
+			fmt.Fprintf(out, "═══ FINDINGS (%d packets, %d IPs) ═══\n", c.PacketCount, len(c.Profiles))
+			ui.RenderFindings(out, c.Findings, ui.FindingsOptions{
+				Color:           color,
+				KindFilter:      filter,
+				MinConfidencePc: minConf,
+				TopN:            top,
+			})
 			if len(c.Summaries) > 0 {
-				fmt.Println("\n═══ DEVICE NARRATIVES ═══")
+				fmt.Fprintln(out, "\n═══ DEVICE NARRATIVES ═══")
 				for _, s := range c.Summaries {
-					fmt.Println(s.String())
+					fmt.Fprintln(out, s.String())
 				}
 			}
 			if c.CrossRef != "" {
-				fmt.Println("\n═══ CROSS REFERENCE ═══")
-				fmt.Println(c.CrossRef)
+				fmt.Fprintln(out, "\n═══ CROSS REFERENCE ═══")
+				fmt.Fprintln(out, c.CrossRef)
 			}
 			return nil
 		},
 	}
 	addDBFlag(cmd, &dbPath)
 	cmd.Flags().BoolVar(&corporate, "corporate", false, "hide consumer detectors (game/streaming/cloud)")
+	cmd.Flags().IntVar(&minConf, "min-confidence", 0, "drop findings below this confidence percent")
+	cmd.Flags().IntVar(&top, "top", 0, "show at most N findings")
+	cmd.Flags().StringVar(&kindFilter, "kind", "all", "all | threat | benign | comma-separated kinds (SCANNER,C2_BEACON)")
+	cmd.Flags().BoolVar(&asJSON, "json", false, "emit JSON")
 	return cmd
 }
 
@@ -257,7 +324,7 @@ func newAskCmd(cfg config.Config) *cobra.Command {
 			}
 			client := llm.New(cfg.OllamaURL, config.ResolveModel(model, cfg), cfg.NumCtx)
 			if !client.Available(context.Background()) {
-				return fmt.Errorf("Ollama not available at %s", cfg.OllamaURL)
+				return fmt.Errorf("ollama not available at %s — try `correlator doctor`", cfg.OllamaURL)
 			}
 			prompt := c.FormatForAI() + "\n\n## Question\n" + question
 			answer, err := client.Generate(context.Background(), prompt)
@@ -290,7 +357,7 @@ func newReportCmd(cfg config.Config) *cobra.Command {
 			}
 			client := llm.New(cfg.OllamaURL, config.ResolveModel(model, cfg), cfg.NumCtx)
 			if !client.Available(context.Background()) {
-				return fmt.Errorf("Ollama not available at %s", cfg.OllamaURL)
+				return fmt.Errorf("ollama not available at %s — try `correlator doctor`", cfg.OllamaURL)
 			}
 			findingsJSON, _ := json.MarshalIndent(c.Findings, "", "  ")
 			devLines := make([]string, len(c.Devices))
@@ -312,8 +379,11 @@ func newReportCmd(cfg config.Config) *cobra.Command {
 Devices:
 %s
 
+Nmap scan summaries:
+%s
+
 Findings:
-%s`, c.FormatForAI(), strings.Join(devLines, "\n"), findingsJSON)
+%s`, c.FormatForAI(), strings.Join(devLines, "\n"), nmapStr, findingsJSON)
 			answer, err := client.Generate(context.Background(), prompt)
 			if err != nil {
 				return err
@@ -404,21 +474,37 @@ func runSearchREPL(dbPath, initial string) {
 	fmt.Println("[System] Commands: ip <addr>, port <num>, dns <domain>, find <text>, devices, stats, help, quit")
 	fmt.Println()
 
-	scanner := bufio.NewScanner(os.Stdin)
+	var ed llm.LineEditor
+	if isTerminal(os.Stdin) {
+		ed, _ = newSearchEditor(db) // degrade silently when readline fails
+	}
+	if ed != nil {
+		defer ed.Close()
+	}
+
 	for {
-		fmt.Print("search> ")
-		if !scanner.Scan() {
+		var line string
+		var err error
+		if ed != nil {
+			line, err = ed.ReadLine("search> ")
+			if errors.Is(err, llm.ErrLineCancelled) {
+				continue
+			}
+		} else {
+			fmt.Print("search> ")
+			line, err = bufio.NewReader(os.Stdin).ReadString('\n')
+		}
+		if err != nil {
 			break
 		}
-		q := strings.TrimSpace(scanner.Text())
+		q := strings.TrimSpace(line)
 		if q == "" {
 			continue
 		}
 		if q == "quit" || q == "exit" || q == "q" {
 			break
 		}
-		out := nlsearch.Execute(db, q)
-		if out != "" {
+		if out := nlsearch.Execute(db, q); out != "" {
 			fmt.Println(out)
 		}
 	}

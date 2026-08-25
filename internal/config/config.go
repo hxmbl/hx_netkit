@@ -194,14 +194,16 @@ func LatestDB() (string, error) {
 // matching capture_<number>.db sort by their number; anything else falls
 // back to plain lexicographic order.
 func CaptureNameLess(a, b string) bool {
-	sa, sb := captureSeq(a), captureSeq(b)
+	sa, sb := CaptureSeq(a), CaptureSeq(b)
 	if sa != sb {
 		return sa < sb
 	}
 	return a < b
 }
 
-func captureSeq(name string) int64 {
+// CaptureSeq extracts the numeric portion of a capture_*.db name (-1 when
+// the name doesn't follow the pattern).
+func CaptureSeq(name string) int64 {
 	base := strings.TrimSuffix(name, ".db")
 	base = strings.TrimPrefix(base, "capture_")
 	n, err := strconv.ParseInt(base, 10, 64)

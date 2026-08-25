@@ -3,6 +3,7 @@ package llm
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -30,6 +31,18 @@ type ScannerEvent struct {
 	Ports      []uint32
 	OSHint     string
 	BeliefLine string
+}
+
+// ErrLineCancelled reports that the user cancelled the current input line
+// (Ctrl-C) without ending the session.
+var ErrLineCancelled = errors.New("input cancelled")
+
+// LineEditor abstracts interactive line input: history, editing keys, and
+// completion in the CLI; plain buffered reads in tests. Implementations
+// return io.EOF to end the session and ErrLineCancelled to re-prompt.
+type LineEditor interface {
+	ReadLine(prompt string) (string, error)
+	Close() error
 }
 
 // EventSource yields pending scanner events without blocking.
@@ -61,10 +74,11 @@ type Session struct {
 	Beliefs   *belief.System
 	Events    EventSource // optional
 	Prompter  Prompter
-	WebOn     bool // live toggle for web tools
+	Editor    LineEditor // optional; falls back to plain buffered reads
+	WebOn     bool       // live toggle for web tools
 	SystemPmt string
 
-	In  io.Reader
+	In  io.Reader // used when Editor is nil
 	Out io.Writer
 
 	messages []Message
@@ -76,8 +90,10 @@ func (s *Session) Run(ctx context.Context) int {
 	if s.Prompter == nil {
 		s.Prompter = AlwaysAllow{}
 	}
-	s.scanner = bufio.NewScanner(s.In)
-	s.scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	if s.Editor == nil && s.In != nil {
+		s.scanner = bufio.NewScanner(s.In)
+		s.scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	}
 
 	defs := tools.Definitions(s.Env.Web != nil)
 
@@ -93,11 +109,10 @@ func (s *Session) Run(ctx context.Context) int {
 	for {
 		s.drainEvents()
 
-		fmt.Fprint(s.Out, "you> ")
-		if !s.scanner.Scan() {
+		input, ok := s.readInput()
+		if !ok {
 			break
 		}
-		input := strings.TrimSpace(s.scanner.Text())
 		if input == "" {
 			continue
 		}
@@ -116,6 +131,30 @@ func (s *Session) Run(ctx context.Context) int {
 		}
 	}
 	return len(s.messages)
+}
+
+// readInput fetches one line via the editor (interactive) or scanner (tests,
+// piped input). Second return is false on EOF/error.
+func (s *Session) readInput() (string, bool) {
+	if s.Editor != nil {
+		line, err := s.Editor.ReadLine("you> ")
+		if err != nil {
+			if errors.Is(err, ErrLineCancelled) {
+				fmt.Fprintln(s.Out, "  (cancelled — Ctrl-D or 'quit' to exit)")
+				return "", true
+			}
+			return "", false
+		}
+		return strings.TrimSpace(line), true
+	}
+	if s.scanner == nil {
+		return "", false
+	}
+	fmt.Fprint(s.Out, "you> ")
+	if !s.scanner.Scan() {
+		return "", false
+	}
+	return strings.TrimSpace(s.scanner.Text()), true
 }
 
 func (s *Session) webEnabled() bool { return s.Env.Web != nil }
@@ -150,6 +189,8 @@ func (s *Session) drainEvents() {
 
 func (s *Session) handleSlash(cmd string) {
 	switch {
+	case cmd == "help" || cmd == "h" || cmd == "?":
+		fmt.Fprint(s.Out, chatHelp)
 	case cmd == "beliefs" || cmd == "belief":
 		if s.Beliefs == nil {
 			fmt.Fprintln(s.Out, "  Belief system not initialized")
@@ -213,7 +254,7 @@ func isSearchCommand(cmd string) bool {
 		first = cmd[:i]
 	}
 	switch strings.ToLower(first) {
-	case "help", "h", "?", "ip", "host", "port", "p", "dns", "d",
+	case "ip", "host", "port", "p", "dns", "d",
 		"find", "f", "search", "s", "devices", "stats",
 		"talkers", "top", "recent", "r", "connections", "conn", "services", "svc":
 		return true
@@ -221,9 +262,25 @@ func isSearchCommand(cmd string) bool {
 	return false
 }
 
+const chatHelp = `═══ Chat ═══
+Plain text goes to the local AI. Slash commands:
+  /beliefs           belief distributions for tracked IPs
+  /scan <IP>         manual nmap probe (updates beliefs)
+  /web on|off        toggle internet tools for this session
+                     (only when started with [web] enabled or --allow-web)
+  /ip <addr> /port <n> /dns <domain> /find <text>
+  /stats /devices /talkers [n] /recent [n]
+  /connections <ip> /services <ip>
+  /help              this help
+  quit               leave
+
+Tools the AI calls (sql, nmap, tshark, packets, …) ask before running
+unless correlator was started with --yes.
+`
+
 func (s *Session) turn(ctx context.Context, defs []map[string]any) bool {
 	activeDefs := defs
-	if !(s.WebOn && s.Env.Web != nil) {
+	if !s.webEnabled() {
 		filtered := make([]map[string]any, 0, len(defs))
 		for _, d := range defs {
 			if fnMap, ok := d["function"].(map[string]any); ok {

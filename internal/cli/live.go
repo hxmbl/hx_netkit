@@ -1,15 +1,19 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/hxmbl/hx_netkit/internal/capture"
 	"github.com/hxmbl/hx_netkit/internal/live"
 	"github.com/hxmbl/hx_netkit/internal/store"
 	"github.com/hxmbl/hx_netkit/internal/tshark"
+	"github.com/hxmbl/hx_netkit/internal/ui"
 )
 
 // captureLiveAndInterpret streams TShark through the interpretation engine,
@@ -36,14 +40,25 @@ func captureLiveAndInterpret(opts liveOptions) error {
 		return err
 	}
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start tshark: %w. Is it installed?", err)
+		return fmt.Errorf("failed to start tshark: %w. Is it installed? (correlator doctor can help)", err)
 	}
 
 	engine := live.NewEngine()
 	count := 0
+	var totalBytes uint64
 	start := time.Now()
 
+	// Ctrl-C stops tshark gracefully so partial captures are kept.
+	sigCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	go func() {
+		<-sigCtx.Done()
+		fmt.Fprintf(os.Stderr, "\n[System] Ctrl-C — stopping capture early…\n")
+		capture.Interrupt(cmd)
+	}()
+
 	done := make(chan struct{})
+	progress := ui.NewProgress(os.Stdout, "[live]", time.Duration(opts.DurationSecs)*time.Second)
 	go func() {
 		defer close(done)
 		_ = capture.StreamLines(stdoutPipe, func(rawLine string) bool {
@@ -67,9 +82,10 @@ func captureLiveAndInterpret(opts liveOptions) error {
 					int64(pkt.UDPsrc), int64(pkt.UDPdst),
 					pkt.DNSQuery, strings.TrimSpace(rawLine), int64(pkt.FrameLen))
 				count++
+				totalBytes += uint64(pkt.FrameLen)
 			}
 
-			if opts.Verbose || count%10 == 0 {
+			if opts.Verbose {
 				elapsed := time.Since(start).Seconds()
 				switch {
 				case pkt.DNSQuery != "":
@@ -79,31 +95,27 @@ func captureLiveAndInterpret(opts liveOptions) error {
 					fmt.Printf("\r\x1b[K  %.1fs | %s → %s:%d (%s)\n",
 						elapsed, orQ(pkt.IPSrc), orQ(pkt.IPDst), pkt.TCPdst, live.ServiceName(uint16(pkt.TCPdst)))
 				}
-			}
-			if count%100 == 0 {
-				elapsed := int(time.Since(start).Seconds())
-				fmt.Printf("\r\x1b[K  %d pkts | %d stored | %ds elapsed  ", count, count, elapsed)
+			} else if !opts.UseAI {
+				progress.MaybeRender(uint64(count), totalBytes)
 			}
 			return true
 		})
 	}()
 
-	// Watchdog: stop the stream once the requested duration elapses, no
-	// matter what the rest of the program is doing.
+	// Watchdog: stop the stream once the requested duration elapses.
 	watchdog := time.AfterFunc(time.Duration(opts.DurationSecs)*time.Second, func() {
 		capture.Interrupt(cmd)
 	})
 
 	if opts.UseAI {
 		cfg := opts.Cfg
-		err := runChat(chatOptions{
+		if err := runChat(chatOptions{
 			DBPath:  dbPath,
 			Model:   opts.Model,
 			Stealth: 2, // passive while chatting on top of live capture
 			Cfg:     cfg,
 			Web:     cfg.Web,
-		})
-		if err != nil {
+		}); err != nil {
 			fmt.Fprintf(os.Stderr, "[Error] chat: %v\n", err)
 		}
 	} else {
@@ -114,6 +126,7 @@ func captureLiveAndInterpret(opts liveOptions) error {
 		}
 	}
 
+	progress.Finish()
 	capture.Interrupt(cmd)
 	select {
 	case <-done:
@@ -134,7 +147,11 @@ func captureLiveAndInterpret(opts liveOptions) error {
 		}
 	}
 
+	store.UpdateLatestSymlink(dbPath)
 	fmt.Printf("\n[System] Database saved at %s\n", dbPath)
+	fmt.Println("[System] Next steps:")
+	fmt.Println("  correlator analyze          # behavioral findings for this capture")
+	fmt.Println("  correlator chat             # ask the local AI about it")
 	return nil
 }
 

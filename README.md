@@ -14,17 +14,13 @@ A Go workspace for network intelligence tooling. Offline-first by design.
 # Build
 go build -o correlator ./cmd/correlator
 
-# Capture packets + nmap scan in parallel
-./correlator capture -i en1 -t 192.168.1.0/24 --duration 300
+# One-command guided flow (recommended first run)
+./correlator run
 
-# Run behavioral analysis — no AI required
-./correlator analyze -d ~/.correlator/captures/capture_1700000000.db
-
-# Chat with a local AI about the capture
-./correlator chat -d ~/.correlator/captures/capture_1700000000.db
-
-# One-shot question
-./correlator ask -d capture.db -q "Which devices are suspicious?"
+# Or step by step:
+./correlator capture -i en0 -t 192.168.1.0/24 --duration 300
+./correlator analyze          # behavioral findings, no AI needed
+./correlator chat             # ask the local AI about the latest capture
 ```
 
 ## Requirements
@@ -34,6 +30,8 @@ go build -o correlator ./cmd/correlator
 - Nmap — host/port discovery
 - Ollama — local AI inference (`qwen3:4b` or similar); optional
 - SQLite — bundled, no separate install
+
+Run `correlator doctor` to check all of the above at once.
 
 ## Design principles
 
@@ -49,17 +47,21 @@ go build -o correlator ./cmd/correlator
 ## Commands
 
 ```
+run             Guided flow — doctor → capture → analyze → chat
+doctor          Verify tools, interfaces, Ollama, disk (with fix hints)
+init            Interactive setup — write a correlator.toml
 capture         Capture packets + nmap scan in parallel, store metadata
 live-interpret  Real-time packet interpretation — no AI needed
 chat            Chat with local AI about captured network data
-analyze         Run behavioral detectors on a capture — no AI required
+analyze         Behavioral findings for a capture — no AI required
 ask             Ask the local AI a single question about a capture
 report          Generate an AI network security report from a capture
 scan            Run nmap only and save results
 search          Search network data — natural-language-ish queries, no AI
 query           Raw SQL over captures (read-only enforced)
 stats/dns/devices/top-talkers   Quick views (--json supported)
-list            List saved captures
+captures        list / info / prune saved captures
+list            List saved capture databases
 version         Print version
 ```
 
