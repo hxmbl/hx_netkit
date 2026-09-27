@@ -46,7 +46,7 @@ jobs:
 
       - name: Package
         run: |
-          TAG="${GITHUB_REF#refs/tags/}"
+          TAG="${GITHUB_REF_NAME}"
           ARCHIVE="correlator-${TAG}-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz"
           tar czf "$ARCHIVE" correlator README.md Changes.md
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
