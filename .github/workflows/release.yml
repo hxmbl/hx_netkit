@@ -82,13 +82,6 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           go run ./internal/devtools/formulagen -version "$VERSION" -dist ./dist -out Formula/correlator.rb
 
-      # Pushes with a repo-scoped SSH deploy key (write access on
-      # hxmbl/homebrew-tap only) — never a personal access token.
-      #
-      # One-time setup:
-      #   ssh-keygen -t ed25519 -C "correlator-tap-deploy" -f tap_deploy_key -N ""
-      #   → add tap_deploy_key.pub as a Deploy key (write) on homebrew-tap
-      #   → `gh secret set TAP_DEPLOY_KEY < tap_deploy_key` in this repo
       - name: Push to tap (needs secret TAP_DEPLOY_KEY)
         env:
           TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
