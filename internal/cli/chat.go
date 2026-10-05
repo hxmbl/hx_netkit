@@ -66,6 +66,7 @@ func runChat(opts chatOptions) error {
 		Cfg:     opts.Cfg,
 		Beliefs: beliefs,
 		Web:     webClient,
+		WebOn:   webClient != nil,
 		Context: netCtx,
 	}
 

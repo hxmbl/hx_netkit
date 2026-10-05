@@ -197,14 +197,30 @@ func newCapturesPruneCmd() *cobra.Command {
 			}
 
 			var victims []captureMeta
+			var undated []captureMeta
 			for i, m := range metas {
 				if keep > 0 && i >= len(metas)-keep {
 					continue // inside the newest `keep`
 				}
-				if !cutoff.IsZero() && !m.Date.IsZero() && m.Date.After(cutoff) {
-					continue
+				if !cutoff.IsZero() {
+					// --older-than is an age guarantee. A file whose name
+					// carries no timestamp cannot be shown to satisfy it,
+					// so leave it alone rather than delete it blindly.
+					if m.Date.IsZero() {
+						undated = append(undated, m)
+						continue
+					}
+					if m.Date.After(cutoff) {
+						continue
+					}
 				}
 				victims = append(victims, m)
+			}
+			if len(undated) > 0 {
+				fmt.Fprintf(out, "Keeping %d file(s) with no timestamp in their name:\n", len(undated))
+				for _, m := range undated {
+					fmt.Fprintf(out, "  %s\n", m.Name)
+				}
 			}
 			if len(victims) == 0 {
 				fmt.Fprintln(out, "Nothing to prune.")

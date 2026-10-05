@@ -135,12 +135,11 @@ func TestDetectServer(t *testing.T) {
 }
 
 func TestDetectScanner(t *testing.T) {
-	p := makeTestProfile("192.168.1.7")
-	// Sequential ports 100..140 (> threshold).
+	// Sequential ports 100..140 on a single host (> threshold).
+	p := newProfile("192.168.1.7")
 	for i := 100; i <= 140; i++ {
-		p.DestPorts[uint32(i)] = 1
+		p.ingest(packet(1000+float64(i), p.IP, "192.168.1.9", uint32(i), 60))
 	}
-	p.OutboundCount = 41
 	f := detectScanner(finalizeCopy(p))
 	if f == nil || f.Kind != KScanner {
 		t.Fatalf("expected scanner finding, got %+v", f)
@@ -234,8 +233,11 @@ func TestDetectVPNTunnel(t *testing.T) {
 }
 
 func TestDetectTorPorts(t *testing.T) {
-	p := makeTestProfile("192.168.1.88")
-	p.SrcPorts[9150] = 60
+	// A Tor client dials out to a relay listening on 9150.
+	p := newProfile("192.168.1.88")
+	for i := 0; i < 30; i++ {
+		p.ingest(packet(1000+float64(i), p.IP, "198.51.100.4", 9150, 400))
+	}
 	f := detectTor(finalizeCopy(p))
 	if f == nil || f.Kind != KTor {
 		t.Fatalf("expected Tor finding, got %+v", f)

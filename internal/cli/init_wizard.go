@@ -68,7 +68,7 @@ func newInitCmd(cfg config.Config) *cobra.Command {
 					"0 · full scan (default) — aggressive nmap + background scanner",
 					"1 · light — rate-limited nmap only",
 					"2 · passive — TShark only, no scanning",
-				}, int(0))
+				}, cfg.StealthLevel)
 			if !ok {
 				return fmt.Errorf("aborted")
 			}

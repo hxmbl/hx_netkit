@@ -299,17 +299,17 @@ func (e *Engine) CrossReference(devices []DeviceInfo) string {
 			lines = append(lines, "  Top connections:\n"+strings.Join(peers, "\n"))
 		}
 
-		var openTCP []string
-		for port := range profile.SrcPorts {
-			if port < PrivilegedPortMax {
-				openTCP = append(openTCP, fmt.Sprint(port))
+		// Listening ports are inbound *destination* ports. SrcPorts are the
+		// ports the peers sent from, which describe the peers' services, not
+		// this host's.
+		if listening := profile.ListenPortList(24); len(listening) > 0 {
+			names := make([]string, len(listening))
+			for i, port := range listening {
+				names[i] = fmt.Sprint(port)
 			}
+			lines = append(lines, "  Listening on: "+strings.Join(names, ", "))
 		}
-		sort.Strings(openTCP)
-		if len(openTCP) > 0 {
-			lines = append(lines, "  Listening on: "+strings.Join(openTCP, ", "))
-		}
-		if clients := len(profile.SrcIPs); clients > 3 {
+		if clients := profile.UniqueClientCount(); clients > 3 {
 			lines = append(lines, fmt.Sprintf("  Serving %d unique clients", clients))
 		}
 	}
@@ -380,7 +380,6 @@ func FormatFindings(findings []Finding) string {
 
 // Realtime maintains a sliding window over recent packets for live analysis.
 type Realtime struct {
-	engine       Engine
 	window       []Packet
 	head         int // logical start index into window (avoids O(n) re-slicing per packet)
 	corporate    bool
@@ -394,7 +393,6 @@ type Realtime struct {
 // consumer detectors from window analyses, mirroring batch Correlate.
 func NewRealtime(windowSecs uint64, corporateMode bool) *Realtime {
 	r := &Realtime{
-		engine:      *NewEngine(),
 		corporate:   corporateMode,
 		windowSecs:  float64(windowSecs),
 		minInterval: 5,
@@ -415,7 +413,6 @@ func defaultNow() float64 { return nowUnix() }
 // Ingest records a packet into the sliding window.
 func (r *Realtime) Ingest(pkt Packet) {
 	r.window = append(r.window, pkt)
-	r.engine.Ingest(pkt)
 
 	cutoff := r.now() - r.windowSecs
 	for r.head < len(r.window) && r.window[r.head].Epoch < cutoff {

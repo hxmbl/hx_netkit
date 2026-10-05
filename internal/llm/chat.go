@@ -69,13 +69,16 @@ func (DenyAll) Allow(string, map[string]any) bool { return false }
 
 // Session wires the chat loop together.
 type Session struct {
-	Client    *Client
-	Env       *tools.Env
-	Beliefs   *belief.System
-	Events    EventSource // optional
-	Prompter  Prompter
-	Editor    LineEditor // optional; falls back to plain buffered reads
-	WebOn     bool       // live toggle for web tools
+	Client   *Client
+	Env      *tools.Env
+	Beliefs  *belief.System
+	Events   EventSource // optional
+	Prompter Prompter
+	Editor   LineEditor // optional; falls back to plain buffered reads
+	// WebOn is the live toggle for the web tools. It starts out matching the
+	// startup consent (Env.Web != nil, i.e. [web] enabled or --allow-web) and
+	// is changed by the /web on|off slash command.
+	WebOn     bool
 	SystemPmt string
 
 	In  io.Reader // used when Editor is nil
@@ -89,6 +92,12 @@ type Session struct {
 func (s *Session) Run(ctx context.Context) int {
 	if s.Prompter == nil {
 		s.Prompter = AlwaysAllow{}
+	}
+	// The web tools are available by default exactly when the user opted in at
+	// startup; /web off then revokes it for the rest of the session.
+	if s.Env != nil && s.Env.Web != nil {
+		s.WebOn = true
+		s.Env.WebOn = true
 	}
 	if s.Editor == nil && s.In != nil {
 		s.scanner = bufio.NewScanner(s.In)
@@ -157,7 +166,11 @@ func (s *Session) readInput() (string, bool) {
 	return strings.TrimSpace(s.scanner.Text()), true
 }
 
-func (s *Session) webEnabled() bool { return s.Env.Web != nil }
+// webEnabled reports whether the web tools may be used right now. Both the
+// startup consent (Env.Web != nil) and the live /web toggle must hold: with
+// only the former checked, "/web off" printed a reassuring message while the
+// tools stayed advertised and kept executing outbound requests.
+func (s *Session) webEnabled() bool { return s.Env != nil && s.Env.Web != nil && s.WebOn }
 
 func (s *Session) drainEvents() {
 	if s.Events == nil {
@@ -207,13 +220,19 @@ func (s *Session) handleSlash(cmd string) {
 				return
 			}
 			s.WebOn = true
+			if s.Env != nil {
+				s.Env.WebOn = true
+			}
 			fmt.Fprintln(s.Out, "  [web] Internet access enabled for this session.")
 		case "off":
 			s.WebOn = false
+			if s.Env != nil {
+				s.Env.WebOn = false
+			}
 			fmt.Fprintln(s.Out, "  [web] Internet access disabled for this session.")
 		default:
 			state := "off"
-			if s.WebOn && s.Env.Web != nil {
+			if s.webEnabled() {
 				state = "on"
 			}
 			fmt.Fprintf(s.Out, "  Usage: /web on|off (currently %s)\n", state)
@@ -262,6 +281,10 @@ func isSearchCommand(cmd string) bool {
 	return false
 }
 
+// isWebTool reports whether a tool name is one of the internet-facing tools
+// gated by the /web toggle.
+func isWebTool(name string) bool { return name == "websearch" || name == "webfetch" }
+
 const chatHelp = `═══ Chat ═══
 Plain text goes to the local AI. Slash commands:
   /beliefs           belief distributions for tracked IPs
@@ -284,7 +307,10 @@ func (s *Session) turn(ctx context.Context, defs []map[string]any) bool {
 		filtered := make([]map[string]any, 0, len(defs))
 		for _, d := range defs {
 			if fnMap, ok := d["function"].(map[string]any); ok {
-				if name, _ := fnMap["name"].(string); name == "websearch" || name == "webfetch" {
+				// Same predicate as the execution gate below, so a tool can
+				// never be withheld from the schema yet still runnable (or
+				// vice versa) after a /web toggle.
+				if name, _ := fnMap["name"].(string); isWebTool(name) {
 					continue
 				}
 			}
@@ -315,12 +341,16 @@ func (s *Session) turn(ctx context.Context, defs []map[string]any) bool {
 		if args == nil {
 			args = map[string]any{}
 		}
-		if !s.Prompter.Allow(name, args) {
+		denied := ""
+		switch {
+		case isWebTool(name) && !s.webEnabled():
+			denied = "[DENIED] Internet access is disabled for this session"
+		case !s.Prompter.Allow(name, args):
+			denied = "[DENIED] User denied " + name
+		}
+		if denied != "" {
 			fmt.Fprintf(s.Out, "  [Tool denied]\n")
-			s.messages = append(s.messages, Message{
-				Role: "tool", ToolName: name,
-				Content: fmt.Sprintf("[DENIED] User denied %s", name),
-			})
+			s.messages = append(s.messages, Message{Role: "tool", ToolName: name, Content: denied})
 			continue
 		}
 		result := s.Env.Execute(ctx, name, args)
