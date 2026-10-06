@@ -4,6 +4,7 @@ package cli
 import (
 	"bufio"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -107,6 +108,10 @@ func newCaptureCmd(cfg config.Config) *cobra.Command {
 		Use:   "capture",
 		Short: "Capture packets + nmap scan in parallel, store metadata",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			level, err := clampStealth(stealth)
+			if err != nil {
+				return err
+			}
 			opts := capture.Options{
 				Interface:    firstNonEmpty(iface, cfg.Interface),
 				Target:       firstNonEmpty(target, cfg.Target),
@@ -115,13 +120,16 @@ func newCaptureCmd(cfg config.Config) *cobra.Command {
 				NoNmap:       noNmap,
 				NoTShark:     noTShark,
 				Debug:        debug,
-				StealthLevel: uint8(stealth),
+				StealthLevel: level,
 				DBPath:       store.CapturePath(noSave, output),
 			}
 			if duration == 0 {
 				opts.DurationSecs = cfg.Duration
 			}
-			_, _, err := capture.Run(opts)
+			if opts.DurationSecs == 0 {
+				return fmt.Errorf("capture duration must be greater than 0 (pass -D, or set duration in correlator.toml)")
+			}
+			_, _, err = capture.Run(opts)
 			return err
 		},
 	}
@@ -134,7 +142,7 @@ func newCaptureCmd(cfg config.Config) *cobra.Command {
 	cmd.Flags().BoolVar(&noNmap, "no-nmap", false, "skip nmap scanning")
 	cmd.Flags().BoolVar(&noTShark, "no-tshark", false, "skip packet capture")
 	cmd.Flags().BoolVar(&debug, "debug", false, "print raw tshark lines")
-	cmd.Flags().IntVar(&stealth, "stealth-level", 0, "0=full scan, 1=light, 2=passive (no scanning)")
+	cmd.Flags().IntVar(&stealth, "stealth-level", cfg.StealthLevel, "0=full scan, 1=light, 2=passive (no scanning)")
 	return cmd
 }
 
@@ -150,9 +158,19 @@ func newLiveInterpretCmd(cfg config.Config) *cobra.Command {
 		Short: "Real-time packet interpretation — no AI needed",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			resolved := config.ResolveModel(model, cfg)
+			// Same fallback as `capture`: an unset -D must not be taken
+			// literally. A zero duration means "stop immediately", which
+			// produces an empty capture before a single packet arrives.
+			secs := duration
+			if secs == 0 {
+				secs = cfg.Duration
+			}
+			if secs == 0 {
+				return fmt.Errorf("capture duration must be greater than 0 (pass -D, or set duration in correlator.toml)")
+			}
 			return runLiveInterpret(liveOptions{
 				Interface:    firstNonEmpty(iface, cfg.Interface),
-				DurationSecs: duration,
+				DurationSecs: secs,
 				NoSave:       noSave,
 				Output:       output,
 				Verbose:      verbose,
@@ -163,7 +181,7 @@ func newLiveInterpretCmd(cfg config.Config) *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVarP(&iface, "interface", "i", "", "network interface")
-	cmd.Flags().Uint64VarP(&duration, "duration", "D", 0, "capture duration in seconds")
+	cmd.Flags().Uint64VarP(&duration, "duration", "D", 0, "capture duration in seconds (default: duration from config)")
 	cmd.Flags().BoolVar(&noSave, "no-save", false, "don't persist")
 	cmd.Flags().StringVarP(&output, "output", "o", "", "database output path")
 	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "verbose per-packet output")
@@ -199,10 +217,14 @@ func newChatCmd(cfg config.Config) *cobra.Command {
 			if allowWeb {
 				webCfg.Enabled = true
 			}
+			level, err := clampStealth(stealth)
+			if err != nil {
+				return err
+			}
 			return runChat(chatOptions{
 				DBPath:  dbPath,
 				Model:   config.ResolveModel(model, cfg),
-				Stealth: uint8(stealth),
+				Stealth: level,
 				Cfg:     cfg,
 				Web:     webCfg,
 				AutoYes: yes,
@@ -211,7 +233,7 @@ func newChatCmd(cfg config.Config) *cobra.Command {
 	}
 	addDBFlag(cmd, &dbPath)
 	cmd.Flags().StringVar(&model, "model", "", "Ollama model override")
-	cmd.Flags().IntVar(&stealth, "stealth-level", 0, "0=full, 1=light, 2=passive")
+	cmd.Flags().IntVar(&stealth, "stealth-level", cfg.StealthLevel, "0=full, 1=light, 2=passive")
 	cmd.Flags().BoolVar(&allowWeb, "allow-web", false, "permit AI websearch/webfetch tools this session")
 	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "auto-approve tool calls without prompting")
 	return cmd
@@ -530,21 +552,29 @@ func newQueryCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("[Error] Query failed: %v", err)
 			}
-			w := bufio.NewWriter(os.Stdout)
+			// Write through the cobra writer so the output is redirectable
+			// (and testable) instead of hard-wired to the process stdout.
+			out := cmd.OutOrStdout()
+			w := bufio.NewWriter(out)
 			defer w.Flush()
 			if format == "csv" {
-				fmt.Fprintln(w, strings.Join(cols, ","))
+				// csv.Writer quotes values containing commas, quotes or
+				// newlines. Packet fields (raw_json, dns_query) contain all
+				// three, so naive joining produced unparseable output.
+				cw := csv.NewWriter(w)
+				_ = cw.Write(cols)
 				for _, r := range rows {
-					fmt.Fprintln(w, strings.Join(r, ","))
+					_ = cw.Write(r)
 				}
+				cw.Flush()
 			} else {
 				fmt.Fprintln(w, cols)
 				fmt.Fprintln(w, strings.Repeat("-", 60))
 				for _, r := range rows {
 					fmt.Fprintln(w, r)
 				}
+				fmt.Fprintf(w, "\n%d rows\n", len(rows))
 			}
-			fmt.Fprintf(w, "\n%d rows\n", len(rows))
 			return nil
 		},
 	}
@@ -743,6 +773,18 @@ func newVersionCmd() *cobra.Command {
 }
 
 // ── shared helpers ──────────────────────────────────────────────────────────
+
+// clampStealth validates a --stealth-level value. The level is used as a
+// uint8, so an out-of-range flag wraps silently: 256 became 0, i.e. an
+// aggressive full scan with a background scanner, and -1 became 255. Reject
+// instead, so an unusable level never quietly changes how much the tool
+// touches the network.
+func clampStealth(v int) (uint8, error) {
+	if v < 0 || v > config.StealthPassive {
+		return 0, fmt.Errorf("invalid --stealth-level %d: use 0 (full), 1 (light) or 2 (passive)", v)
+	}
+	return uint8(v), nil
+}
 
 func firstNonEmpty(vals ...string) string {
 	for _, v := range vals {

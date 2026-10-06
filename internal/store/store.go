@@ -155,6 +155,11 @@ func (d *DB) Unlock() { <-d.mu }
 // InsertPacket stores one packet row. The epoch is always written as-is
 // (never NULL) so downstream readers can ORDER BY and scan it directly;
 // zero-value ports/strings are stored as NULL, mirroring the v1 schema.
+//
+// Note that a caller which could not parse a frame's timestamp should skip
+// the frame rather than store it with epoch 0: such rows sort ahead of every
+// real packet and stretch profile durations, which is why intel.LoadPackets
+// ignores unusable epochs when reading.
 func (d *DB) InsertPacket(epoch float64, src, dst string, tsrc, tdst, usrc, udst int64, dnsQuery, rawJSON string, frameLen int64) error {
 	d.Lock()
 	defer d.Unlock()

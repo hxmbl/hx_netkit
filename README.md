@@ -39,6 +39,7 @@ Run `correlator doctor` to check all of the above at once.
    against a local Ollama daemon. Nothing phones home, ever.
 2. **Opt-in internet.** The AI can use `websearch` / `webfetch` tools only if
    you allow it: set `[web] enabled = true` in config or pass `--allow-web`.
+   `/web off` in chat revokes it for the rest of the session.
    Local/private addresses are always blocked for fetches.
 3. **Consent-gated tools.** In chat, every tool call the model makes is shown
    and requires approval (`y` / `a` = always / `n`), unless `--yes` is passed.
@@ -125,6 +126,7 @@ model     = "qwen3:4b"        # top-level override wins over [ai].model
 num_ctx   = 12288              # Ollama context window (2048..32768)
 ollama_url = "http://localhost:11434"
 corporate_mode = false         # hides game/streaming/cloud-sync detectors
+stealth_level  = 0             # 0=full scan, 1=light, 2=passive (no scanning)
 
 [ai]
 model   = "qwen3:4b"

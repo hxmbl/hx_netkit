@@ -37,6 +37,7 @@ type Config struct {
 	OllamaURL     string `toml:"ollama_url"`
 	NumCtx        int    `toml:"num_ctx"`
 	CorporateMode bool   `toml:"corporate_mode"`
+	StealthLevel  int    `toml:"stealth_level"` // 0=full 1=light 2=passive; written by `correlator init`
 	AI            AI     `toml:"ai"`
 	Web           Web    `toml:"web"`
 
@@ -145,7 +146,22 @@ func (c *Config) normalize() {
 	if c.Web.Provider == "" {
 		c.Web.Provider = "duckduckgo"
 	}
+	// Stealth levels are 0 (full), 1 (light) and 2 (passive).
+	if c.StealthLevel < 0 {
+		c.StealthLevel = 0
+	}
+	if c.StealthLevel > StealthPassive {
+		c.StealthLevel = StealthPassive
+	}
 }
+
+// Stealth levels, mirrored from the nmap package (which cannot be imported
+// here without a cycle).
+const (
+	StealthFull    = 0
+	StealthLight   = 1
+	StealthPassive = 2
+)
 
 // ResolveModel picks the Ollama model: explicit CLI flag wins, then a
 // customized top-level model, then [ai].model.

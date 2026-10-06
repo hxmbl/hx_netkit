@@ -50,6 +50,7 @@ model         = %q          # top-level model override
 num_ctx       = %d          # Ollama context window (2048..32768)
 
 corporate_mode = false      # true hides game/streaming/cloud-sync detectors
+stealth_level  = %d         # 0=full scan, 1=light, 2=passive (no scanning)
 
 [ai]
 model   = %q
@@ -63,5 +64,5 @@ enabled = true
 # searxng_url     = "http://localhost:8888"
 # brave_api_key   = "..."
 # tavily_api_key  = "..."
-`, v.Interface, v.Target, v.Duration, v.Model, v.NumCtx, v.Model, webBlock)
+`, v.Interface, v.Target, v.Duration, v.Model, v.NumCtx, v.Stealth, v.Model, webBlock)
 }

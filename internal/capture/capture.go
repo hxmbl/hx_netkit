@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -127,6 +128,10 @@ func Run(opts Options) (int, int, error) {
 		stored, err = runTShark(db, opts, out)
 		if err != nil {
 			wg.Wait()
+			// The partial capture is still worth keeping: point latest.db at
+			// it so `analyze`/`chat` can work with what was collected, then
+			// report the failure.
+			store.UpdateLatestSymlink(opts.DBPath)
 			return stored, countDevices(db), err
 		}
 	}
@@ -179,7 +184,7 @@ func runTShark(db *store.DB, opts Options, out io.Writer) (int, error) {
 	defer stopSignals()
 	go func() {
 		select {
-		case <-time.After(time.Duration(opts.DurationSecs) * time.Second):
+		case <-time.After(SecondsToDuration(opts.DurationSecs)):
 			interrupt(cmd)
 		case <-timerStop:
 		case <-sigCtx.Done():
@@ -191,7 +196,7 @@ func runTShark(db *store.DB, opts Options, out io.Writer) (int, error) {
 
 	count := 0
 	var totalBytes uint64
-	progress := ui.NewProgress(out, "[cap]", time.Duration(opts.DurationSecs)*time.Second)
+	progress := ui.NewProgress(out, "[cap]", SecondsToDuration(opts.DurationSecs))
 	scanner := bufio.NewScanner(stdoutPipe)
 	scanner.Buffer(make([]byte, 0, 256*1024), 1024*1024)
 	for scanner.Scan() {
@@ -203,13 +208,22 @@ func runTShark(db *store.DB, opts Options, out io.Writer) (int, error) {
 		if !ok {
 			continue
 		}
-		count++
-		totalBytes += uint64(pkt.FrameLen)
-		_ = db.InsertPacket(
+		// A frame without a usable timestamp carries no timing evidence; the
+		// store refuses it too, but skip it here so the reported count only
+		// ever includes packets that are actually stored.
+		if !pkt.HasEpoch || pkt.Epoch <= 0 {
+			continue
+		}
+		if err := db.InsertPacket(
 			pkt.Epoch, pkt.IPSrc, pkt.IPDst,
 			i64(pkt.TCPsrc), i64(pkt.TCPdst), i64(pkt.UDPsrc), i64(pkt.UDPdst),
 			pkt.DNSQuery, strings.TrimSpace(rawLine), i64(pkt.FrameLen),
-		)
+		); err != nil {
+			fmt.Fprintf(out, "[Warn] packet insert failed: %v\n", err)
+			continue
+		}
+		count++
+		totalBytes += uint64(pkt.FrameLen)
 		if opts.Debug {
 			fmt.Fprintf(os.Stderr, "[debug] %s\n", rawLine)
 		}
@@ -229,6 +243,14 @@ func runTShark(db *store.DB, opts Options, out io.Writer) (int, error) {
 		} else {
 			fmt.Fprintln(out, "\n[Warn] No packets captured — was the interface idle? Try `correlator doctor`.")
 		}
+	}
+
+	// A scanner error means the stream was cut short (an oversized ek line
+	// exceeds the buffer, or the pipe broke). Reporting a clean "CAPTURE
+	// COMPLETE" for a truncated capture hides missing evidence, so surface it.
+	if serr := scanner.Err(); serr != nil {
+		fmt.Fprintf(out, "\n[Warn] tshark stream ended early after %d packets: %v\n", count, serr)
+		return count, fmt.Errorf("tshark stream truncated after %d packets: %w", count, serr)
 	}
 
 	return count, nil
@@ -277,3 +299,22 @@ func wait(cmd *exec.Cmd) {
 }
 
 func i64(v uint32) int64 { return int64(v) }
+
+// SecondsToDuration converts a capture duration in seconds to a time.Duration
+// without overflowing. A raw `time.Duration(secs) * time.Second` wraps to a
+// NEGATIVE duration once secs exceeds MaxInt64/1e9 (~9.2e9), and a negative
+// duration means "already expired" — the capture then stops instantly, which
+// is the same failure as a zero duration but silently accepted.
+func SecondsToDuration(secs uint64) time.Duration {
+	if secs > maxCaptureSeconds {
+		secs = maxCaptureSeconds
+	}
+	return time.Duration(secs) * time.Second
+}
+
+// maxCaptureSeconds keeps SecondsToDuration's result inside int64 even after
+// callers add a small slack (e.g. "+ 2*time.Second" grace periods), which
+// would otherwise re-introduce the overflow one step later. The headroom is a
+// full hour; the ceiling itself is ~292 years and only ever applies to absurd
+// flag values such as -D 18446744073709551615.
+const maxCaptureSeconds = uint64(math.MaxInt64)/uint64(time.Second) - 3600

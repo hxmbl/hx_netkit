@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -44,7 +45,14 @@ func captureLiveAndInterpret(opts liveOptions) error {
 	}
 
 	engine := live.NewEngine()
-	count := 0
+	// The reader goroutine below keeps mutating the capture counters, the
+	// interpretation engine and the progress meter until tshark's stdout
+	// closes, while this goroutine prints the summary and drains the engine.
+	// stateMu serializes those two halves, so the closing report can never be
+	// computed from half-written state (and the reader can't still be
+	// appending packets while Interpret walks the engine's maps).
+	var stateMu sync.Mutex
+	var count int
 	var totalBytes uint64
 	start := time.Now()
 
@@ -58,7 +66,7 @@ func captureLiveAndInterpret(opts liveOptions) error {
 	}()
 
 	done := make(chan struct{})
-	progress := ui.NewProgress(os.Stdout, "[live]", time.Duration(opts.DurationSecs)*time.Second)
+	progress := ui.NewProgress(os.Stdout, "[live]", capture.SecondsToDuration(opts.DurationSecs))
 	go func() {
 		defer close(done)
 		_ = capture.StreamLines(stdoutPipe, func(rawLine string) bool {
@@ -74,15 +82,22 @@ func captureLiveAndInterpret(opts liveOptions) error {
 				p := uint16(pkt.TCPdst)
 				tcpDst = &p
 			}
-			if pkt.IPSrc != "" && pkt.IPDst != "" {
+			stateMu.Lock()
+			// A frame with no usable timestamp carries no timing evidence;
+			// skip it entirely so the counters below match what is stored.
+			if pkt.HasEpoch && pkt.Epoch > 0 && pkt.IPSrc != "" && pkt.IPDst != "" {
 				engine.ProcessPacket(pkt.Epoch, pkt.IPSrc, pkt.IPDst, tcpDst, pkt.DNSQuery)
-				_ = db.InsertPacket(
+				err := db.InsertPacket(
 					pkt.Epoch, pkt.IPSrc, pkt.IPDst,
 					int64(pkt.TCPsrc), int64(pkt.TCPdst),
 					int64(pkt.UDPsrc), int64(pkt.UDPdst),
 					pkt.DNSQuery, strings.TrimSpace(rawLine), int64(pkt.FrameLen))
-				count++
-				totalBytes += uint64(pkt.FrameLen)
+				if err == nil {
+					count++
+					totalBytes += uint64(pkt.FrameLen)
+				} else {
+					fmt.Fprintf(os.Stderr, "[Warn] packet insert failed: %v\n", err)
+				}
 			}
 
 			if opts.Verbose {
@@ -98,12 +113,13 @@ func captureLiveAndInterpret(opts liveOptions) error {
 			} else if !opts.UseAI {
 				progress.MaybeRender(uint64(count), totalBytes)
 			}
+			stateMu.Unlock()
 			return true
 		})
 	}()
 
 	// Watchdog: stop the stream once the requested duration elapses.
-	watchdog := time.AfterFunc(time.Duration(opts.DurationSecs)*time.Second, func() {
+	watchdog := time.AfterFunc(capture.SecondsToDuration(opts.DurationSecs), func() {
 		capture.Interrupt(cmd)
 	})
 
@@ -121,21 +137,24 @@ func captureLiveAndInterpret(opts liveOptions) error {
 	} else {
 		select {
 		case <-done:
-		case <-time.After(time.Duration(opts.DurationSecs)*time.Second + 2*time.Second):
+		case <-time.After(capture.SecondsToDuration(opts.DurationSecs) + 2*time.Second):
 			// watchdog already fired; give the reader a moment to drain
 		}
 	}
 
-	progress.Finish()
 	capture.Interrupt(cmd)
-	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-	}
+	stateMu.Lock()
+	progress.Finish()
+	stateMu.Unlock()
 	capture.Kill(cmd)
 	capture.Wait(cmd)
 	watchdog.Stop()
+	// Killing the child closes its stdout, which ends the reader goroutine.
+	// Wait for it before touching any of the state it was mutating.
+	<-done
 
+	stateMu.Lock()
+	defer stateMu.Unlock()
 	fmt.Printf("\n\n═══ CAPTURE COMPLETE ═══\n")
 	fmt.Printf("[System] %d packets captured, %d stored\n", count, count)
 

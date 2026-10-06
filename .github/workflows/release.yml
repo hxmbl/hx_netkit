@@ -48,6 +48,21 @@ jobs:
         run: |
           TAG="${GITHUB_REF_NAME}"
           ARCHIVE="correlator-${TAG}-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz"
+          # Changelog is generated from git history for this release rather
+          # than kept as a committed file, so it can never drift from the
+          # commits that actually shipped in the tag.
+          PREV="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
+          {
+            echo "# correlator ${TAG}"
+            echo
+            if [ -n "$PREV" ]; then
+              echo "Changes since ${PREV}:"
+              echo
+              git log --no-merges --pretty='- %s (%h)' "${PREV}..${TAG}"
+            else
+              echo "Initial release."
+            fi
+          } > Changes.md
           tar czf "$ARCHIVE" correlator README.md Changes.md
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
 

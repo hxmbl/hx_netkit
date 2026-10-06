@@ -10,6 +10,7 @@ ollama_url = "http://localhost:11434"
 num_ctx    = 12288                # Ollama context window; clamped to 2048..32768
 
 corporate_mode = false            # true = hide game/streaming/cloud-sync detectors
+stealth_level  = 0                # 0=full scan, 1=light, 2=passive (no scanning)
 
 [ai]
 model   = "qwen3:4b"

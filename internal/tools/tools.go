@@ -42,7 +42,16 @@ type Env struct {
 	Web      *websearch.Client      // nil unless user enabled web access
 	Context  *netctx.NetworkContext // cached analysis of the current capture
 	ExecNmap nmap.Runner            // injectable runner (defaults to exec)
+
+	// WebOn is the live consent toggle flipped by "/web on|off" in chat.
+	// It is only consulted when Web is non-nil, and the web tools refuse to
+	// run unless it is set — so revoking access takes effect at the point of
+	// use, not merely by hiding the tool schema from the model.
+	WebOn bool
 }
+
+// WebPermitted reports whether the internet tools may run right now.
+func (e *Env) WebPermitted() bool { return e.Web != nil && e.WebOn }
 
 func fn(name, desc string, props map[string]any, required ...string) map[string]any {
 	return map[string]any{
@@ -894,8 +903,11 @@ func (e *Env) toolTShark(filter string, duration int64) Result {
 }
 
 func (e *Env) toolWebSearch(ctx context.Context, query string) Result {
-	if e.Web == nil {
+	switch {
+	case e.Web == nil:
 		return Result{"websearch", "Disabled", "Internet access is disabled. Enable [web] in config or pass --allow-web."}
+	case !e.WebPermitted():
+		return Result{"websearch", "Disabled", "Internet access is disabled for this session. The user ran /web off."}
 	}
 	if query == "" || len(query) > 200 {
 		return Result{"websearch", "Invalid query", "Query must be 1-200 characters."}
@@ -915,8 +927,11 @@ func (e *Env) toolWebSearch(ctx context.Context, query string) Result {
 }
 
 func (e *Env) toolWebFetch(ctx context.Context, url string) Result {
-	if e.Web == nil {
+	switch {
+	case e.Web == nil:
 		return Result{"webfetch", "Disabled", "Internet access is disabled. Enable [web] in config or pass --allow-web."}
+	case !e.WebPermitted():
+		return Result{"webfetch", "Disabled", "Internet access is disabled for this session. The user ran /web off."}
 	}
 	text, status, err := e.Web.FetchPage(ctx, url, 4000)
 	if err != nil {

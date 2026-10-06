@@ -235,13 +235,8 @@ func describeActivity(p *Profile) string {
 		}
 	}
 
-	privileged := 0
-	for port := range p.SrcPorts {
-		if port < 1024 {
-			privileged++
-		}
-	}
-	if privileged > 0 {
+	// Inbound destination ports are what this host actually answers on.
+	if privileged := p.PrivilegedListenCount(); privileged > 0 {
 		parts = append(parts, fmt.Sprintf("listening on %d privileged ports", privileged))
 	}
 	if p.DestPortEntropy > 3.0 {
@@ -409,13 +404,7 @@ func buildNarrative(p *Profile, findings []Finding, deviceType, role, temporal s
 		fmt.Fprintf(&b, "%d long-lived sessions (>30s). ", long)
 	}
 
-	privileged := 0
-	for port := range p.SrcPorts {
-		if port < 1024 {
-			privileged++
-		}
-	}
-	if privileged > 0 {
+	if privileged := p.PrivilegedListenCount(); privileged > 0 {
 		fmt.Fprintf(&b, "Listening on %d privileged ports. ", privileged)
 	}
 

@@ -144,9 +144,16 @@ var gamePorts = []uint32{
 	7777, // Unreal Engine
 }
 
-var torPorts = []uint32{9001, 9002, 9003, 9030, 9031, 9150, 443}
+// torPorts are ports specific to Tor: the ORPort (9001 and alternates), the
+// DirPort (9030/9031) and the SOCKS port (9150). 443 is deliberately absent
+// even though relays do run there — it is what ordinary HTTPS uses, so
+// including it flags every web client as a relay.
+var torPorts = []uint32{9001, 9002, 9003, 9030, 9031, 9150}
 
-var vpnPorts = []uint32{1194, 4500, 500, 1723, 1195, 8443, 443}
+// vpnPorts are the default ports of well-known VPN protocols: OpenVPN 1194,
+// L2TP 1701/1723, IPsec IKE 500 / NAT-T 4500, and WireGuard 51820. 443 and
+// 8443 are excluded because they are the default ports of ordinary HTTPS.
+var vpnPorts = []uint32{1194, 4500, 500, 1701, 1723, 1195, 51820}
 
 var reconMgmtPorts = []uint32{22, 23, 80, 443, 8080, 3389, 5900, 21, 2323, 9100}
 
@@ -245,9 +252,13 @@ func detectBrowser(p *Profile) *Finding {
 		score += 0.25
 		ind = append(ind, fmt.Sprintf("%d unique domains resolved", len(p.DNSDomains)))
 	}
-	if len(p.SrcPorts) > BrowserSrcPortsMin {
+	// Ephemeral ports this host ORIGINATES connections from. SrcPorts records
+	// the port the peer connected from, which for any client is a small fixed
+	// set of service ports ({443} for HTTPS) — using it here credited the
+	// signal to receiving hosts and made it unreachable for real browsers.
+	if opened := p.EphemeralOwnSrcPortCount(); opened > BrowserSrcPortsMin {
 		score += 0.15
-		ind = append(ind, fmt.Sprintf("%d ephemeral source ports", len(p.SrcPorts)))
+		ind = append(ind, fmt.Sprintf("%d ephemeral source ports", opened))
 	}
 	if hits := domainHasSuffix(p.DNSDomains, browserDomains); len(hits) >= BrowserCDNHitsMin {
 		score += 0.2
@@ -343,13 +354,16 @@ func detectServer(p *Profile) *Finding {
 	score := 0.0
 	var ind []string
 
-	if len(p.SrcIPs) > ServerClientsMin {
+	if clients := p.UniqueClientCount(); clients > ServerClientsMin {
 		score += 0.3
-		ind = append(ind, fmt.Sprintf("%d unique clients", len(p.SrcIPs)))
+		ind = append(ind, fmt.Sprintf("%d unique clients", clients))
 	}
 
+	// Listening ports come from inbound *destination* ports. SrcPorts are the
+	// ports the remote sent from, which would report every HTTPS client as
+	// "listening on 443".
 	var listening []uint32
-	for port := range p.SrcPorts {
+	for port := range p.ListenPorts {
 		if port < 1024 {
 			listening = append(listening, port)
 		}
@@ -372,7 +386,10 @@ func detectServer(p *Profile) *Finding {
 		}
 	}
 
-	if len(p.DestPorts) > ServerDestPortsMin {
+	// DestPorts are ports this host connects TO; for a server those are the
+	// ephemeral ports of the clients it answers. Only meaningful for a host
+	// that actually replies, so gate it the same way as the client count.
+	if clients := p.UniqueClientCount(); clients > 0 && len(p.DestPorts) > ServerDestPortsMin {
 		score += 0.15
 		ind = append(ind, fmt.Sprintf("responding to %d client ports", len(p.DestPorts)))
 	}
@@ -511,9 +528,14 @@ func detectScanner(p *Profile) *Finding {
 	score := 0.0
 	var ind []string
 
-	if len(p.DestPorts) > ScannerPortThreshold {
+	// Port-scanning is measured per destination host and only counts for a
+	// host that is predominantly sending. A plain count of distinct
+	// destination ports misfires badly: every server that answers N clients
+	// accumulates N distinct ephemeral reply ports on that one client and
+	// looks like a scanner.
+	if p.MaxPortsOnPeer() > ScannerPortThreshold && isSending(p) {
 		score += 0.35
-		ind = append(ind, fmt.Sprintf("port scanning: %d unique ports", len(p.DestPorts)))
+		ind = append(ind, fmt.Sprintf("port scanning: %d unique ports on one host", p.MaxPortsOnPeer()))
 	}
 
 	avgPktsPerDest := 0.0
@@ -531,12 +553,11 @@ func detectScanner(p *Profile) *Finding {
 		ind = append(ind, "SYN scan pattern (high outbound, low response)")
 	}
 
-	ports := make([]uint32, 0, len(p.DestPorts))
-	for pt := range p.DestPorts {
-		ports = append(ports, pt)
-	}
-	sort.Slice(ports, func(i, j int) bool { return ports[i] < ports[j] })
-	if len(ports) >= 5 {
+	// Sequential enumeration must also be judged on one host's port list, and
+	// only for a host that is predominantly sending (same reasoning as the
+	// port-diversity signal above).
+	ports := p.WidestPeerPorts()
+	if len(ports) >= 5 && isSending(p) {
 		seq := 0
 		for i := 1; i < len(ports); i++ {
 			if ports[i]-ports[i-1] <= 2 {
@@ -639,7 +660,7 @@ func detectVPN(p *Profile) *Finding {
 	}
 	if len(p.DestIPs) <= VPNMaxDestIPs && p.PacketCount > VPNMinPackets {
 		score += 0.2
-		ind = append(ind, fmt.Sprintf("tunnel to %d IPs", len(p.DestIPs)))
+		ind = append(ind, fmt.Sprintf("tunnel to %d IP(s)", len(p.DestIPs)))
 	}
 	if ip, count := maxEntryStr(p.DestIPs); ip != "" {
 		if float64(count)/float64(p.PacketCount) > VPNTunnelRatio && count > VPNTunnelMin {
@@ -661,10 +682,17 @@ func detectTor(p *Profile) *Finding {
 	score := 0.0
 	var ind []string
 
+	// Tor traffic to a relay is outbound (the client dials the relay), and a
+	// relay is identified by the port it *answers* on. Either direction works
+	// for a relay, but 443 must not count (see torPorts).
 	var torHits []string
-	for port := range p.SrcPorts {
-		if containsU32(torPorts, port) {
-			torHits = append(torHits, fmt.Sprint(port))
+	seen := map[uint32]bool{}
+	for _, ports := range []map[uint32]uint64{p.ListenPorts, p.DestPorts} {
+		for port := range ports {
+			if containsU32(torPorts, port) && !seen[port] {
+				seen[port] = true
+				torHits = append(torHits, fmt.Sprint(port))
+			}
 		}
 	}
 	sort.Strings(torHits)
@@ -672,7 +700,8 @@ func detectTor(p *Profile) *Finding {
 		score += 0.35
 		ind = append(ind, "Tor ports: "+strings.Join(torHits, ", "))
 	}
-	if len(p.SrcIPs) > TorRelayClientsMin && p.PacketCount > TorRelayPacketsMin {
+	if len(p.SrcIPs) > TorRelayClientsMin && p.PacketCount > TorRelayPacketsMin &&
+		p.InboundCount > p.OutboundCount {
 		score += 0.2
 		ind = append(ind, fmt.Sprintf("relay behavior: %d clients, %d pkts", len(p.SrcIPs), p.PacketCount))
 	}

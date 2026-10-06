@@ -66,10 +66,18 @@ type Profile struct {
 	LastSeen    float64
 	PacketCount uint64
 
+	// DestPorts are ports this host SENDS to; SrcPorts are ports the remote
+	// sent from; ListenPorts are ports this host ANSWERS on (inbound
+	// destination ports); OwnSrcPorts are ports this host originates
+	// connections from. The sets are direction-relative: for a sending host
+	// DestPorts name the services it uses, for a receiving host they are just
+	// one ephemeral port per client. Detectors must not mix them up.
 	DestIPs           map[string]uint64
 	SrcIPs            map[string]uint64
 	DestPorts         map[uint32]uint64
 	SrcPorts          map[uint32]uint64
+	ListenPorts       map[uint32]uint64
+	OwnSrcPorts       map[uint32]uint64
 	UniqueConnections int64
 
 	Sessions map[string]*TCPSession
@@ -86,10 +94,14 @@ type Profile struct {
 	temporalBins      []temporalBin
 	interArrivalTimes []float64
 
-	DestPortEntropy float64
-	SrcPortEntropy  float64
+	// Per-peer destination-port sets. Port scanning is a *per-peer*
+	// property: a scanner touches many ports on one host, while a server
+	// that merely replies spreads one ephemeral client port per client.
+	peerPorts      map[string]map[uint32]struct{}
+	maxPortsOnPeer int
+	widestPeer     string
 
-	wellKnownPorts, ephemeralPorts, privilegedPorts []uint32
+	DestPortEntropy float64
 
 	PacketSizeVariance float64
 	m2                 float64 // streaming sum of squared deviations (Welford)
@@ -99,15 +111,18 @@ type Profile struct {
 
 func newProfile(ip string) *Profile {
 	return &Profile{
-		IP:         ip,
-		FirstSeen:  math.MaxFloat64,
-		LastSeen:   math.SmallestNonzeroFloat64,
-		DestIPs:    map[string]uint64{},
-		SrcIPs:     map[string]uint64{},
-		DestPorts:  map[uint32]uint64{},
-		SrcPorts:   map[uint32]uint64{},
-		Sessions:   map[string]*TCPSession{},
-		DNSDomains: map[string]uint64{},
+		IP:          ip,
+		FirstSeen:   math.MaxFloat64,
+		LastSeen:    math.SmallestNonzeroFloat64,
+		DestIPs:     map[string]uint64{},
+		SrcIPs:      map[string]uint64{},
+		DestPorts:   map[uint32]uint64{},
+		SrcPorts:    map[uint32]uint64{},
+		ListenPorts: map[uint32]uint64{},
+		OwnSrcPorts: map[uint32]uint64{},
+		peerPorts:   map[string]map[uint32]struct{}{},
+		Sessions:    map[string]*TCPSession{},
+		DNSDomains:  map[string]uint64{},
 	}
 }
 
@@ -130,6 +145,13 @@ func (p *Profile) ingest(pkt Packet) {
 		}
 		if dp := pkt.dstPort(); dp > 0 {
 			p.DestPorts[dp]++
+			p.notePeerPort(pkt.DstIP, dp)
+		}
+		// Ports this host originates connections from. For a client these are
+		// the ephemeral ports it opens; for a server they are its service
+		// ports on the replies it sends.
+		if sp := pkt.srcPort(); sp > 0 {
+			p.OwnSrcPorts[sp]++
 		}
 	}
 	if isDst {
@@ -139,6 +161,10 @@ func (p *Profile) ingest(pkt Packet) {
 		}
 		if sp := pkt.srcPort(); sp > 0 {
 			p.SrcPorts[sp]++
+		}
+		// Inbound destination ports are the ports this host answers on.
+		if dp := pkt.dstPort(); dp > 0 {
+			p.ListenPorts[dp]++
 		}
 	}
 
@@ -226,20 +252,104 @@ func sessionKey(src string, sport uint32, dst string, dport uint32) string {
 	return b.String()
 }
 
-func (p *Profile) finalize() {
-	p.DestPortEntropy = portSetEntropy(p.DestPorts)
-	p.SrcPortEntropy = portSetEntropy(p.SrcPorts)
+// notePeerPort records one destination port reached on a given peer and keeps
+// the widest single-peer port set. Port-scanning evidence must be measured
+// per peer: summing ports across peers makes an ordinary server look like a
+// scanner, because every reply it sends carries a different ephemeral client
+// port.
+func (p *Profile) notePeerPort(peer string, port uint32) {
+	if peer == "" {
+		return
+	}
+	if p.peerPorts == nil {
+		p.peerPorts = map[string]map[uint32]struct{}{}
+	}
+	set := p.peerPorts[peer]
+	if set == nil {
+		set = map[uint32]struct{}{}
+		p.peerPorts[peer] = set
+	}
+	if _, seen := set[port]; seen {
+		return
+	}
+	set[port] = struct{}{}
+	if len(set) > p.maxPortsOnPeer {
+		p.maxPortsOnPeer = len(set)
+		p.widestPeer = peer
+	}
+}
 
-	for port := range p.SrcPorts {
-		switch {
-		case port < PrivilegedPortMax:
-			p.privilegedPorts = append(p.privilegedPorts, port)
-		case port >= EphemeralPortMin:
-			p.ephemeralPorts = append(p.ephemeralPorts, port)
-		default:
-			p.wellKnownPorts = append(p.wellKnownPorts, port)
+// isSending reports whether outbound traffic dominates for this profile.
+// Describing a host by what it *sends* (the ports it reaches, the hosts it
+// talks to) only makes sense for a host that is mostly sending.
+func isSending(p *Profile) bool { return p.OutboundCount > p.InboundCount }
+
+// UniqueClientCount counts inbound peers (possible clients). A host that is
+// mostly *sending* has the servers it talks to as its inbound peers, so
+// those must not be reported as "clients" — that mislabels every ordinary
+// web/streaming client as a server.
+func (p *Profile) UniqueClientCount() int {
+	if isSending(p) {
+		return 0
+	}
+	return len(p.SrcIPs)
+}
+
+// MaxPortsOnPeer reports the largest number of distinct destination ports this
+// host contacted on any single peer. This is the port-scan signature.
+func (p *Profile) MaxPortsOnPeer() int { return p.maxPortsOnPeer }
+
+// WidestPeerPorts returns the sorted destination ports contacted on the peer
+// with the most distinct ports.
+func (p *Profile) WidestPeerPorts() []uint32 {
+	set := p.peerPorts[p.widestPeer]
+	out := make([]uint32, 0, len(set))
+	for port := range set {
+		out = append(out, port)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+// PrivilegedListenCount counts ports below 1024 this host answered on.
+func (p *Profile) PrivilegedListenCount() int {
+	n := 0
+	for port := range p.ListenPorts {
+		if port < PrivilegedPortMax {
+			n++
 		}
 	}
+	return n
+}
+
+// ListenPortList returns the sorted ports this host answered on, capped at n.
+func (p *Profile) ListenPortList(n int) []uint32 {
+	out := make([]uint32, 0, len(p.ListenPorts))
+	for port := range p.ListenPorts {
+		out = append(out, port)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	if n > 0 && len(out) > n {
+		out = out[:n]
+	}
+	return out
+}
+
+// EphemeralOwnSrcPortCount counts distinct ephemeral-range ports this host
+// originates connections from — the signal that separates a client opening
+// many short-lived connections from a server answering on a fixed port.
+func (p *Profile) EphemeralOwnSrcPortCount() int {
+	n := 0
+	for port := range p.OwnSrcPorts {
+		if port >= EphemeralPortMin {
+			n++
+		}
+	}
+	return n
+}
+
+func (p *Profile) finalize() {
+	p.DestPortEntropy = portSetEntropy(p.DestPorts)
 
 	p.UniqueConnections = int64(len(p.Sessions) + len(p.DestIPs) + len(p.SrcIPs))
 
@@ -436,6 +546,13 @@ func LoadPackets(db *sql.DB) ([]Packet, error) {
 		var tcps, tcpd, udps, udpd, fl sql.NullInt64
 		var epoch sql.NullFloat64
 		if err := rows.Scan(&epoch, &src, &dst, &tcps, &tcpd, &udps, &udpd, &dns, &fl); err != nil {
+			continue
+		}
+		// Rows with a missing/zero timestamp (legacy captures written before
+		// the epoch column was guaranteed) carry no timing evidence. Counting
+		// them as epoch 0 would stretch every profile's duration to ~the
+		// capture's absolute time and silently destroy beacon/C2 detection.
+		if !epoch.Valid || epoch.Float64 <= 0 {
 			continue
 		}
 		p.Epoch = epoch.Float64

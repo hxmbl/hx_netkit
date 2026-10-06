@@ -83,7 +83,7 @@ func newRunCmd(cfg config.Config) *cobra.Command {
 			duration := parseNonNeg(durStr, uint64(cfg.Duration))
 
 			stealthIdx, ok2 := askChoice(br, out, "Stealth level",
-				[]string{"0 · full scan", "1 · light scan", "2 · passive"}, 0)
+				[]string{"0 · full scan", "1 · light scan", "2 · passive"}, cfg.StealthLevel)
 			if !ok2 {
 				return fmt.Errorf("aborted")
 			}

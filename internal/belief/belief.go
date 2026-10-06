@@ -8,6 +8,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/hxmbl/hx_netkit/internal/intel"
 )
@@ -52,7 +53,13 @@ type IPBelief struct {
 }
 
 // System holds beliefs for all tracked IPs.
+//
+// It is shared between the chat loop and the background scanner goroutine
+// (which folds nmap evidence in every few seconds), so every method is
+// guarded: unguarded map reads and writes race and can abort the process with
+// Go's unrecoverable "concurrent map read and map write".
 type System struct {
+	mu      sync.RWMutex
 	beliefs map[string]*IPBelief
 }
 
@@ -60,15 +67,41 @@ type System struct {
 func New() *System { return &System{beliefs: map[string]*IPBelief{}} }
 
 // Len returns number of tracked IPs.
-func (s *System) Len() int { return len(s.beliefs) }
+func (s *System) Len() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.beliefs)
+}
 
 // Has reports whether ip is tracked.
-func (s *System) Has(ip string) bool { _, ok := s.beliefs[ip]; return ok }
+func (s *System) Has(ip string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.beliefs[ip]
+	return ok
+}
 
-// Get returns the belief for ip.
+// Get returns a snapshot copy of the belief for ip. A copy is returned (not
+// the stored pointer) so callers cannot read the distribution while the
+// scanner goroutine is rewriting it.
 func (s *System) Get(ip string) (*IPBelief, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	b, ok := s.beliefs[ip]
-	return b, ok
+	if !ok {
+		return nil, false
+	}
+	return b.snapshot(), true
+}
+
+func (b *IPBelief) snapshot() *IPBelief {
+	dist := make(map[Category]float64, len(b.Dist))
+	for k, v := range b.Dist {
+		dist[k] = v
+	}
+	cp := *b
+	cp.Dist = dist
+	return &cp
 }
 
 func categoryForKind(k intel.Kind) Category {
@@ -88,8 +121,20 @@ func categoryForKind(k intel.Kind) Category {
 }
 
 // InitializeFromFindings seeds beliefs from detector output.
+//
+// Correlate() emits several findings per IP sorted by descending confidence,
+// and a single IP can be both benign and threatening. Only the strongest
+// finding may seed the distribution — letting later (weaker) findings
+// overwrite it silently downgrades a confident threat verdict, e.g. a 90%
+// DATA_EXFIL host that also produced a 40% SERVER finding.
 func (s *System) InitializeFromFindings(findings []intel.Finding) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	best := map[string]float64{}
 	for _, f := range findings {
+		if prev, ok := best[f.IP]; ok && f.Confidence < prev {
+			continue
+		}
 		primary := categoryForKind(f.Kind)
 		primaryProb := f.Confidence * 0.8
 		residual := 1 - primaryProb
@@ -113,6 +158,7 @@ func (s *System) InitializeFromFindings(findings []intel.Finding) {
 		}
 		normalize(dist)
 
+		best[f.IP] = f.Confidence
 		s.beliefs[f.IP] = &IPBelief{
 			IP:      f.IP,
 			Dist:    dist,
@@ -126,6 +172,8 @@ func (s *System) InitializeFromFindings(findings []intel.Finding) {
 
 // Ensure adds ip with the default prior if not already tracked.
 func (s *System) Ensure(ip string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if _, ok := s.beliefs[ip]; ok {
 		return
 	}
@@ -154,6 +202,8 @@ func (s *System) Ensure(ip string) {
 // uncertainty, capped at maxScans per IP. Returns ok=false when nothing needs
 // scanning.
 func (s *System) PriorityIP(maxScans uint32) (ip string, ent float64, ok bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	bestEnt := -1.0
 	for _, b := range s.beliefs {
 		if b.ScanCount >= maxScans || b.MaxProb >= 0.90 {
@@ -171,6 +221,8 @@ func (s *System) PriorityIP(maxScans uint32) (ip string, ent float64, ok bool) {
 
 // UpdateFromNmap folds scan evidence into the belief for ip.
 func (s *System) UpdateFromNmap(ip string, alive bool, openPorts []uint32) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	b, exists := s.beliefs[ip]
 	if !exists {
 		return
@@ -250,6 +302,8 @@ func (s *System) UpdateFromNmap(ip string, alive bool, openPorts []uint32) {
 
 // FormatAll renders every belief sorted by descending uncertainty.
 func (s *System) FormatAll() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	type row struct {
 		name string
 		line string
@@ -276,6 +330,8 @@ func (s *System) FormatAll() string {
 
 // FormatIP renders one IP's belief line, if tracked.
 func (s *System) FormatIP(ip string) (string, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	b, ok := s.beliefs[ip]
 	if !ok {
 		return "", false

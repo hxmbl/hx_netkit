@@ -6,7 +6,7 @@
 //
 // Usage:
 //
-//	go run ./internal/devtools/formulagen -version v2.1.0 -dist ./dist [-out path]
+//	go run ./internal/devtools/formulagen -version <tag> -dist ./dist [-out path]
 package main
 
 import (
@@ -90,7 +90,7 @@ func sha256File(path string) (string, error) {
 }
 
 func main() {
-	version := flag.String("version", "", "release version WITHOUT leading v (e.g. 2.1.0)")
+	version := flag.String("version", "", "release version WITHOUT leading v (e.g. 2.2.0)")
 	dist := flag.String("dist", "./dist", "directory containing correlator-<tag>-<goos>-<goarch>.tar.gz files")
 	out := flag.String("out", "-", "output path ('-' = stdout)")
 	flag.Parse()
