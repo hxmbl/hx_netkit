@@ -148,4 +148,4 @@ the v1 Rust release read perfectly — just point `-d` at them.
 
 ## License
 
-No.
+MIT — see [LICENSE](LICENSE).
